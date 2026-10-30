@@ -1,4 +1,4 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import express from 'express';
 import pino from 'pino';
@@ -6,6 +6,8 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+
+// CommonJS මොඩියුලක් නිසා මේ විදියට import කරගන්නවා
 import giftedBtns from 'gifted-btns';
 const { sendButtons } = giftedBtns;
 
@@ -22,10 +24,10 @@ const __dirname = path.dirname(__filename);
 // 1. Configuration (Railway Environment Variables)
 // ==========================================
 const CONFIG = {
-    PORT: process.env.PORT || 3000,
+    PORT: process.env.PORT || 8080,
     DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD || "admin123", 
     BOT_PHONE_NUMBER: process.env.BOT_PHONE_NUMBER || "94771234567", 
-    REWARD: 30, // රු. 30
+    REWARD: 30, 
     
     TG_API_ID: parseInt(process.env.TG_API_ID || "0"),
     TG_API_HASH: process.env.TG_API_HASH || "",
@@ -65,7 +67,7 @@ const taskService = {
             db.prepare('INSERT INTO tasks (task_id, user_id, amount) VALUES (?, ?, ?)').run(taskId, userId, amount); 
             return true; 
         } catch (e) { 
-            return false; // Duplicate task
+            return false; 
         }
     }
 };
@@ -77,8 +79,8 @@ let currentPairingCode = null;
 let waStatus = 'offline';
 let sockInstance = null;
 let tgClient = null;
-const userStates = new Map(); // WhatsApp user step (WAIT_QR, WAIT_CODE)
-const waToTgMap = new Map();  // Map WhatsApp User to Telegram
+const userStates = new Map(); 
+const waToTgMap = new Map();  
 
 // ==========================================
 // 4. Express Server (Admin Dashboard)
@@ -102,7 +104,7 @@ app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard: http://localhost:${CO
 // ==========================================
 async function initTelegram() {
     if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) {
-        console.log("⚠️ Telegram Config missing. Bot will run without Telegram.");
+        console.log("⚠️ Telegram Config missing.");
         return;
     }
     
@@ -121,7 +123,6 @@ async function initTelegram() {
 
             const text = message.message || '';
 
-            // සාර්ථක මැසේජ් එකක් ආවොත් බැලන්ස් එක එකතු කිරීම
             if (text.includes('Success') || text.includes('created successfully')) {
                 const taskId = `task_${Date.now()}_${waChatId}`;
                 if (taskService.add(taskId, waChatId, CONFIG.REWARD)) {
@@ -140,9 +141,6 @@ async function initTelegram() {
             } 
             else if (text.includes('CLICK AGAIN TO CONFIRM')) {
                 await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_confirm_2fa', text: '[‼️ CLICK AGAIN TO CONFIRM ‼️]' }] });
-            } 
-            else if (text.toLowerCase().includes('qr')) {
-                await sockInstance.sendMessage(waChatId, { text: text });
             } 
             else {
                 await sockInstance.sendMessage(waChatId, { text: text });
@@ -171,111 +169,126 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
 // 6. WhatsApp Bot Logic (Baileys)
 // ==========================================
 async function connectWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
-    
-    sockInstance = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'silent' }),
-        browser: ['Gmail Farmer', 'Chrome', '1.0.0']
-    });
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
+        
+        // WhatsApp එකේ අලුත්ම Version එක ගන්නවා
+        const { version, isLatest } = await fetchLatestWaWebVersion({});
+        console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
 
-    if (!sockInstance.authState.creds.registered) {
-        setTimeout(async () => {
-            try {
-                const code = await sockInstance.requestPairingCode(CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, ''));
-                currentPairingCode = code;
-                console.log(`🔑 Pairing Code: ${code}`);
-            } catch (err) { console.log("Pairing Code Error:", err.message); }
-        }, 5000);
-    }
+        sockInstance = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: ['Gmail Farmer', 'Chrome', '1.0.0']
+        });
 
-    sockInstance.ev.on('creds.update', saveCreds);
+        sockInstance.ev.on('creds.update', saveCreds);
 
-    sockInstance.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'close') {
-            waStatus = 'offline';
-            currentPairingCode = null;
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) connectWhatsApp();
-        } else if (connection === 'open') {
-            waStatus = 'connected';
-            currentPairingCode = null;
-            console.log('✅ WhatsApp Connected!');
-            initTelegram();
-        }
-    });
+        sockInstance.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
 
-    sockInstance.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.fromMe) return;
-
-        const from = msg.key.remoteJid;
-        const sender = msg.key.participant || from;
-        const type = Object.keys(msg.message)[0];
-        const state = userStates.get(sender) || 'IDLE';
-
-        // Auto Read Status
-        if (from === 'status@broadcast') {
-            await sockInstance.readMessages([msg.key]);
-            return;
-        }
-
-        // --- Handle Buttons ---
-        if (type === 'buttonsResponseMessage' || type === 'interactiveResponseMessage') {
-            const btnId = msg.message.buttonsResponseMessage?.selectedButtonId 
-                       || JSON.parse(msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || '{}').id;
-
-            if (btnId === 'btn_register') await sendToTg(sender, '/start');
-            else if (btnId === 'btn_balance') {
-                let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
-                await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+            // QR එක ජෙනරේට් වෙනකොට Pairing Code එක ගන්නවා (මේක තමයි හරිම විදිය)
+            if (qr && !sockInstance.authState.creds.registered) {
+                if (!currentPairingCode) {
+                    setTimeout(async () => {
+                        try {
+                            const cleanNumber = CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, '');
+                            const code = await sockInstance.requestPairingCode(cleanNumber);
+                            currentPairingCode = code;
+                            console.log(`\n\n🔑 Pairing Code: ${code}\n\n`);
+                        } catch (err) { 
+                            console.log("Pairing Code Error:", err.message); 
+                        }
+                    }, 3000); // සොකට් එක හරියටම සෙට් වෙන්න තත්පර 3ක් ඉන්නවා
+                }
             }
-            else if (btnId === 'go_menu') {
-                await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
+
+            if (connection === 'close') {
+                waStatus = 'offline';
+                currentPairingCode = null;
+                const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+                if (shouldReconnect) {
+                    console.log('Reconnecting...');
+                    connectWhatsApp();
+                }
+            } else if (connection === 'open') {
+                waStatus = 'connected';
+                currentPairingCode = null;
+                console.log('✅ WhatsApp Connected!');
+                initTelegram();
             }
-            else if (btnId === 'btn_cancel') await sendToTg(sender, 'Cancel');
-            else if (btnId === 'btn_done') await sendToTg(sender, 'Done');
-            else if (btnId === 'btn_enable_2fa') await sendToTg(sender, 'Enable 2FA');
-            else if (btnId === 'btn_confirm_2fa') {
-                userStates.set(sender, 'WAIT_QR');
-                await sendToTg(sender, 'Confirm');
-            }
-            return;
-        }
+        });
 
-        // --- Handle QR Image ---
-        if (type === 'imageMessage' && state === 'WAIT_QR') {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {});
-            await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
-            userStates.set(sender, 'WAIT_CODE');
-            await sockInstance.sendMessage(from, { text: '✅ QR Code එක ලැබුණා. දැන් ඔබට ලැබුණු අකුරු 16ේ කෝඩ් එක එවන්න.' });
-            return;
-        }
+        sockInstance.ev.on('messages.upsert', async (m) => {
+            const msg = m.messages[0];
+            if (!msg.message || msg.key.fromMe) return;
 
-        // --- Handle Text (Commands & 16-Char Code) ---
-        if (type === 'conversation' || type === 'extendedTextMessage') {
-            const text = msg.message.conversation || msg.message.extendedTextMessage.text;
-            const cmd = text.trim().toLowerCase();
+            const from = msg.key.remoteJid;
+            const sender = msg.key.participant || from;
+            const type = Object.keys(msg.message)[0];
+            const state = userStates.get(sender) || 'IDLE';
 
-            if (state === 'WAIT_CODE') {
-                await sendToTg(sender, text);
+            if (from === 'status@broadcast') {
+                await sockInstance.readMessages([msg.key]);
                 return;
             }
 
-            if (cmd === '/start' || cmd === '.menu') {
-                userService.create(sender);
-                await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
-            } 
-            else if (cmd === '.ping') await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
-            else if (cmd === 'balance') {
-                let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
-                await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+            if (type === 'buttonsResponseMessage' || type === 'interactiveResponseMessage') {
+                const btnId = msg.message.buttonsResponseMessage?.selectedButtonId 
+                           || JSON.parse(msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || '{}').id;
+
+                if (btnId === 'btn_register') await sendToTg(sender, '/start');
+                else if (btnId === 'btn_balance') {
+                    let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
+                    await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+                }
+                else if (btnId === 'go_menu') {
+                    await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
+                }
+                else if (btnId === 'btn_cancel') await sendToTg(sender, 'Cancel');
+                else if (btnId === 'btn_done') await sendToTg(sender, 'Done');
+                else if (btnId === 'btn_enable_2fa') await sendToTg(sender, 'Enable 2FA');
+                else if (btnId === 'btn_confirm_2fa') {
+                    userStates.set(sender, 'WAIT_QR');
+                    await sendToTg(sender, 'Confirm');
+                }
+                return;
             }
-        }
-    });
+
+            if (type === 'imageMessage' && state === 'WAIT_QR') {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
+                userStates.set(sender, 'WAIT_CODE');
+                await sockInstance.sendMessage(from, { text: '✅ QR Code එක ලැබුණා. දැන් ඔබට ලැබුණු අකුරු 16ේ කෝඩ් එක එවන්න.' });
+                return;
+            }
+
+            if (type === 'conversation' || type === 'extendedTextMessage') {
+                const text = msg.message.conversation || msg.message.extendedTextMessage.text;
+                const cmd = text.trim().toLowerCase();
+
+                if (state === 'WAIT_CODE') {
+                    await sendToTg(sender, text);
+                    return;
+                }
+
+                if (cmd === '/start' || cmd === '.menu') {
+                    userService.create(sender);
+                    await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
+                } 
+                else if (cmd === '.ping') await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
+                else if (cmd === 'balance') {
+                    let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
+                    await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+                }
+            }
+        });
+
+    } catch (error) {
+        console.log("WhatsApp Connection Error:", error);
+    }
 }
 
-// Start the bot
 connectWhatsApp();
