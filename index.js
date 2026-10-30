@@ -4,7 +4,6 @@ const Database = require("better-sqlite3");
 const fs = require("fs");
 const path = require("path");
 
-// CommonJS require
 const { sendButtons } = require('gifted-btns');
 const { TelegramClient } = require("telegram");
 const { StringSession } = require("telegram/sessions");
@@ -19,9 +18,6 @@ const {
     fetchLatestWaWebVersion
 } = require("@whiskeysockets/baileys");
 
-// ==========================================
-// 1. Configuration
-// ==========================================
 const CONFIG = {
     PORT: process.env.PORT || 8080,
     DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD || "admin123", 
@@ -35,9 +31,6 @@ const CONFIG = {
 
 const LOGO_URL = 'https://files.catbox.moe/eic9dy.png';
 
-// ==========================================
-// 2. Database Setup
-// ==========================================
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 const db = new Database(path.join(dataDir, 'bot.db'));
@@ -64,15 +57,10 @@ const taskService = {
         try { 
             db.prepare('INSERT INTO tasks (task_id, user_id, amount) VALUES (?, ?, ?)').run(taskId, userId, amount); 
             return true; 
-        } catch (e) { 
-            return false; 
-        }
+        } catch (e) { return false; }
     }
 };
 
-// ==========================================
-// 3. State Management
-// ==========================================
 let currentPairingCode = null;
 let waStatus = 'offline';
 let sockInstance = null;
@@ -80,25 +68,18 @@ let tgClient = null;
 const userStates = new Map(); 
 const waToTgMap = new Map();  
 
-// ==========================================
-// 4. Express Server (Admin Dashboard)
-// ==========================================
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/api/dashboard', (req, res) => {
-    res.json({
-        status: waStatus,
-        pairingCode: currentPairingCode,
-        users: userService.getAll()
-    });
+    res.json({ status: waStatus, pairingCode: currentPairingCode, users: userService.getAll() });
 });
 app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard running on port ${CONFIG.PORT}`));
 
 // ==========================================
-// 5. Telegram Relay Logic
+// Telegram Relay Logic
 // ==========================================
 async function initTelegram() {
     if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) return;
@@ -110,7 +91,6 @@ async function initTelegram() {
         console.log("✅ Telegram Connected!");
 
         tgClient.addEventHandler(async (event) => {
-            // 🚨 මේක තමයි අර Error එක ආව තැන හැදුවේ
             if (!event.message) return; 
 
             const message = event.message;
@@ -119,9 +99,25 @@ async function initTelegram() {
             const waChatId = waToTgMap.get(CONFIG.TG_BOT);
             if (!waChatId) return;
 
-            const text = message.message || '';
+            let text = message.message || '';
 
-            if (text.includes('Success') || text.includes('created successfully')) {
+            // 🚨 මෙතන තමයි ඩොලර් අගය LKR 30 ලෙස වෙනස් වෙන්නේ
+            // උදාහරණයක් විදියට "from 0.18$ to 0.23$" වගේ එකක් ආවොත් ඒක "LKR 30.00" වෙනවා
+            text = text.replace(/from\s*[\d.]+\$\s*to\s*[\d.]+\$/gi, "LKR 30.00");
+            // තනි $ ලකුණක් එක්ක එන අගයන් (උදා: 0.23$) LKR 30 වෙන්න
+            text = text.replace(/[\d.]+(\$| USD)/gi, "LKR 30.00");
+
+            if (text.includes('Register Gmail accounts') || text.includes('Email:') || text.includes('Password:')) {
+                // රෙජිස්ටර් වෙන මුල් මැසේජ් එකට අපේ බටන් දෙක දානවා
+                await sendButtons(sockInstance, waChatId, { 
+                    text: text, 
+                    buttons: [
+                        { id: 'btn_done', text: '✔ Done' }, 
+                        { id: 'btn_cancel', text: '🚫 Cancel registration' }
+                    ] 
+                });
+            } 
+            else if (text.includes('Success') || text.includes('created successfully')) {
                 const taskId = `task_${Date.now()}_${waChatId}`;
                 if (taskService.add(taskId, waChatId, CONFIG.REWARD)) {
                     userService.addBalance(waChatId, CONFIG.REWARD);
@@ -131,11 +127,8 @@ async function initTelegram() {
                 }
                 userStates.delete(waChatId);
             } 
-            else if (text.includes('Done') || text.includes('Cancel') || text.includes('registration')) {
-                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_done', text: '✔ Done' }, { id: 'btn_cancel', text: '🚫 Cancel registration' }] });
-            } 
             else if (text.includes('Enable 2FA')) {
-                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA (0.23$)' }] });
+                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA' }] });
             } 
             else if (text.includes('CLICK AGAIN TO CONFIRM')) {
                 await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_confirm_2fa', text: '[‼️ CLICK AGAIN TO CONFIRM ‼️]' }] });
@@ -164,12 +157,11 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
 }
 
 // ==========================================
-// 6. WhatsApp Bot Logic
+// WhatsApp Bot Logic
 // ==========================================
 async function connectWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
-        
         const { version } = await fetchLatestWaWebVersion().catch(() => ({ version: [2, 3000, 1038544855] }));
 
         sockInstance = makeWASocket({
@@ -187,12 +179,8 @@ async function connectWhatsApp() {
                     const cleanNumber = CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, '');
                     const code = await sockInstance.requestPairingCode(cleanNumber);
                     currentPairingCode = code;
-                    console.log(`\n==============================================`);
-                    console.log(`🔑 YOUR PAIRING CODE IS: ${code}`);
-                    console.log(`==============================================\n`);
-                } catch (err) { 
-                    console.log("Pairing Code Error:", err.message); 
-                }
+                    console.log(`\n🔑 YOUR PAIRING CODE IS: ${code}\n`);
+                } catch (err) { console.log("Pairing Code Error:", err.message); }
             }, 3000);
         }
 
@@ -200,15 +188,11 @@ async function connectWhatsApp() {
 
         sockInstance.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
-
             if (connection === 'close') {
                 waStatus = 'offline';
                 currentPairingCode = null;
                 const shouldReconnect = (lastDisconnect?.error instanceof DisconnectReason || lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
-                if (shouldReconnect) {
-                    console.log('Reconnecting...');
-                    connectWhatsApp();
-                }
+                if (shouldReconnect) connectWhatsApp();
             } else if (connection === 'open') {
                 waStatus = 'connected';
                 currentPairingCode = null;
@@ -223,8 +207,6 @@ async function connectWhatsApp() {
 
             const from = msg.key.remoteJid;
             const sender = msg.key.participant || from;
-            
-            // 🚨 මේක තමයි වැදගත්ම වෙනස්කම. බටන් එරර් එක අල්ලගන්න මේක දැම්මා
             const msgContent = normalizeMessageContent(msg.message) || msg.message;
             const type = Object.keys(msgContent)[0];
             const state = userStates.get(sender) || 'IDLE';
@@ -234,23 +216,18 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // බටන් ඔබද්දි එන හැම වර්ගයක්ම අල්ලගන්නවා
             let btnId = null;
             if (type === 'buttonsResponseMessage') {
                 btnId = msgContent.buttonsResponseMessage.selectedButtonId;
             } else if (type === 'interactiveResponseMessage') {
                 const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
                 btnId = params.id;
-            } else if (type === 'templateButtonReplyMessage') {
-                btnId = msgContent.templateButtonReplyMessage.selectedId;
-            } else if (type === 'listResponseMessage') {
-                btnId = msgContent.listResponseMessage.singleSelectReply.selectedRowId;
             }
 
-            // බටන් එකක් ඔබලා නම් මේක වැඩ කරනවා
             if (btnId) {
-                console.log(`👉 Button Clicked: ${btnId}`); // ලොග්ස් වල පේන්න
-                if (btnId === 'btn_register') await sendToTg(sender, '/start');
+                if (btnId === 'btn_register') {
+                    await sendToTg(sender, '+ Register a new Gmail');
+                }
                 else if (btnId === 'btn_balance') {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
                     await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
@@ -258,17 +235,16 @@ async function connectWhatsApp() {
                 else if (btnId === 'go_menu') {
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
                 }
-                else if (btnId === 'btn_cancel') await sendToTg(sender, 'Cancel');
-                else if (btnId === 'btn_done') await sendToTg(sender, 'Done');
+                else if (btnId === 'btn_cancel') await sendToTg(sender, '/cancel');
+                else if (btnId === 'btn_done') await sendToTg(sender, '/done');
                 else if (btnId === 'btn_enable_2fa') await sendToTg(sender, 'Enable 2FA');
                 else if (btnId === 'btn_confirm_2fa') {
                     userStates.set(sender, 'WAIT_QR');
-                    await sendToTg(sender, 'Confirm');
+                    await sendToTg(sender, '/confirm');
                 }
                 return;
             }
 
-            // ෆොටෝ එවනකොට (QR)
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
@@ -277,7 +253,6 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // අකුරු එවනකොට
             if (type === 'conversation' || type === 'extendedTextMessage') {
                 const text = msgContent.conversation || msgContent.extendedTextMessage?.text || '';
                 const cmd = text.trim().toLowerCase();
