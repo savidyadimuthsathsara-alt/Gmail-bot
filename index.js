@@ -50,23 +50,31 @@ async function sendMenu(sock, jid) {
     await sock.sendMessage(jid, { text: welcome });
   }
 
-  // Two selectable WhatsApp reply buttons, as requested.
-  try {
-    await sock.sendMessage(jid, {
-      text: "🌱 *GMAIL FARMER MENU*",
-      footer: "Select one option",
-      buttons: [
-        { buttonId: "register_new_gmail", buttonText: { displayText: "📩 Register New Gmail" }, type: 1 },
-        { buttonId: "balance", buttonText: { displayText: "💰 Balance" }, type: 1 }
-      ],
-      headerType: 1
-    });
-  } catch (err) {
-    // Compatibility fallback for WhatsApp clients that do not render legacy buttons.
-    await sock.sendMessage(jid, {
-      text: "🌱 *GMAIL FARMER MENU*\\n\\n1️⃣ 📩 Register New Gmail\\n2️⃣ 💰 Balance\\n\\nReply with *1* or *2*."
-    });
-  }
+  // Use a WhatsApp list message rather than legacy buttons, which some
+  // WhatsApp/Baileys client combinations silently render as plain text.
+  await sock.sendMessage(jid, {
+    text: "🌱 *GMAIL FARMER MENU*",
+    footer: "Select one option",
+    title: "GMAIL FARMER",
+    buttonText: "OPEN MENU",
+    sections: [
+      {
+        title: "Main Menu",
+        rows: [
+          {
+            title: "📩 Register New Gmail",
+            rowId: "register_new_gmail",
+            description: "Open the registration information"
+          },
+          {
+            title: "💰 Balance",
+            rowId: "balance",
+            description: "View your personal balance"
+          }
+        ]
+      }
+    ]
+  });
 }
 
 let sock;
