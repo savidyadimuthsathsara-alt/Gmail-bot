@@ -1,34 +1,31 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage, fetchLatestWaWebVersion } from '@whiskeysockets/baileys';
-import { Boom } from '@hapi/boom';
-import express from 'express';
-import pino from 'pino';
-import Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+const express = require("express");
+const pino = require("pino");
+const Database = require("better-sqlite3");
+const fs = require("fs");
+const path = require("path");
 
-// CommonJS මොඩියුලක් නිසා මේ විදියට import කරගන්නවා
-import giftedBtns from 'gifted-btns';
-const { sendButtons } = giftedBtns;
+// CommonJS require
+const { sendButtons } = require('gifted-btns');
+const { TelegramClient } = require("telegram");
+const { StringSession } = require("telegram/sessions");
 
-import telegramPkg from "telegram";
-const { TelegramClient } = telegramPkg;
-
-import sessionsPkg from "telegram/sessions/index.js";
-const { StringSession } = sessionsPkg;
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    Browsers,
+    downloadMediaMessage,
+    fetchLatestWaWebVersion
+} = require("@whiskeysockets/baileys");
 
 // ==========================================
-// 1. Configuration (Railway Environment Variables)
+// 1. Configuration
 // ==========================================
 const CONFIG = {
     PORT: process.env.PORT || 8080,
     DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD || "admin123", 
     BOT_PHONE_NUMBER: process.env.BOT_PHONE_NUMBER || "94771234567", 
     REWARD: 30, 
-    
     TG_API_ID: parseInt(process.env.TG_API_ID || "0"),
     TG_API_HASH: process.env.TG_API_HASH || "",
     TG_SESSION: process.env.TG_SESSION || "", 
@@ -38,7 +35,7 @@ const CONFIG = {
 const LOGO_URL = 'https://files.catbox.moe/eic9dy.png';
 
 // ==========================================
-// 2. Database Setup (SQLite)
+// 2. Database Setup
 // ==========================================
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
@@ -97,16 +94,13 @@ app.get('/api/dashboard', (req, res) => {
         users: userService.getAll()
     });
 });
-app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard: http://localhost:${CONFIG.PORT}`));
+app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard running on port ${CONFIG.PORT}`));
 
 // ==========================================
 // 5. Telegram Relay Logic
 // ==========================================
 async function initTelegram() {
-    if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) {
-        console.log("⚠️ Telegram Config missing.");
-        return;
-    }
+    if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) return;
     
     try {
         const session = new StringSession(CONFIG.TG_SESSION);
@@ -166,49 +160,48 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
 }
 
 // ==========================================
-// 6. WhatsApp Bot Logic (Baileys)
+// 6. WhatsApp Bot Logic (ඔයාගේ වැඩ කරන බොට්ගේ සෙටින්ග්ස් වලින්)
 // ==========================================
 async function connectWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
         
-        // WhatsApp එකේ අලුත්ම Version එක ගන්නවා
-        const { version, isLatest } = await fetchLatestWaWebVersion({});
-        console.log(`Using WA v${version.join('.')}, isLatest: ${isLatest}`);
+        // ඔයාගේ බොට් එකේ තියෙන විදියටම අලුත්ම Version එක ගන්නවා
+        const { version } = await fetchLatestWaWebVersion().catch(() => ({ version: [2, 3000, 1038544855] }));
 
         sockInstance = makeWASocket({
             version,
             auth: state,
+            browser: Browsers.ubuntu("Chrome"), // 👈 ඔයාගේ බොට් එකේ තියෙන විදිය
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            browser: ['Gmail Farmer', 'Chrome', '1.0.0']
+            markOnlineOnConnect: false // 👈 ඔයාගේ බොට් එකේ තියෙන විදිය
         });
+
+        if (!sockInstance.authState.creds.registered) {
+            setTimeout(async () => {
+                try {
+                    const cleanNumber = CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, '');
+                    const code = await sockInstance.requestPairingCode(cleanNumber);
+                    currentPairingCode = code;
+                    console.log(`\n==============================================`);
+                    console.log(`🔑 YOUR PAIRING CODE IS: ${code}`);
+                    console.log(`==============================================\n`);
+                } catch (err) { 
+                    console.log("Pairing Code Error:", err.message); 
+                }
+            }, 3000);
+        }
 
         sockInstance.ev.on('creds.update', saveCreds);
 
         sockInstance.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-
-            // QR එක ජෙනරේට් වෙනකොට Pairing Code එක ගන්නවා (මේක තමයි හරිම විදිය)
-            if (qr && !sockInstance.authState.creds.registered) {
-                if (!currentPairingCode) {
-                    setTimeout(async () => {
-                        try {
-                            const cleanNumber = CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, '');
-                            const code = await sockInstance.requestPairingCode(cleanNumber);
-                            currentPairingCode = code;
-                            console.log(`\n\n🔑 Pairing Code: ${code}\n\n`);
-                        } catch (err) { 
-                            console.log("Pairing Code Error:", err.message); 
-                        }
-                    }, 3000); // සොකට් එක හරියටම සෙට් වෙන්න තත්පර 3ක් ඉන්නවා
-                }
-            }
+            const { connection, lastDisconnect } = update;
 
             if (connection === 'close') {
                 waStatus = 'offline';
                 currentPairingCode = null;
-                const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+                const shouldReconnect = (lastDisconnect?.error instanceof DisconnectReason || lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
                 if (shouldReconnect) {
                     console.log('Reconnecting...');
                     connectWhatsApp();
@@ -216,7 +209,7 @@ async function connectWhatsApp() {
             } else if (connection === 'open') {
                 waStatus = 'connected';
                 currentPairingCode = null;
-                console.log('✅ WhatsApp Connected!');
+                console.log('✅ WhatsApp Connected Successfully!');
                 initTelegram();
             }
         });
@@ -258,7 +251,7 @@ async function connectWhatsApp() {
             }
 
             if (type === 'imageMessage' && state === 'WAIT_QR') {
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
                 userStates.set(sender, 'WAIT_CODE');
                 await sockInstance.sendMessage(from, { text: '✅ QR Code එක ලැබුණා. දැන් ඔබට ලැබුණු අකුරු 16ේ කෝඩ් එක එවන්න.' });
