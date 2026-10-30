@@ -50,30 +50,31 @@ async function sendMenu(sock, jid) {
     await sock.sendMessage(jid, { text: welcome });
   }
 
-  // Use a WhatsApp list message rather than legacy buttons, which some
-  // WhatsApp/Baileys client combinations silently render as plain text.
+  // Baileys v7 native-flow quick-reply buttons.
   await sock.sendMessage(jid, {
-    text: "🌱 *GMAIL FARMER MENU*",
-    footer: "Select one option",
-    title: "GMAIL FARMER",
-    buttonText: "OPEN MENU",
-    sections: [
-      {
-        title: "Main Menu",
-        rows: [
+    interactiveMessage: {
+      header: { title: "🌱 GMAIL FARMER" },
+      body: { text: "Select an option to continue:" },
+      footer: { text: "GMAIL FARMER WHATSAPP BOT" },
+      nativeFlowMessage: {
+        buttons: [
           {
-            title: "📩 Register New Gmail",
-            rowId: "register_new_gmail",
-            description: "Open the registration information"
+            name: "quick_reply",
+            buttonParamsJson: JSON.stringify({
+              display_text: "📩 Register New Gmail",
+              id: "register_new_gmail"
+            })
           },
           {
-            title: "💰 Balance",
-            rowId: "balance",
-            description: "View your personal balance"
+            name: "quick_reply",
+            buttonParamsJson: JSON.stringify({
+              display_text: "💰 Balance",
+              id: "balance"
+            })
           }
         ]
       }
-    ]
+    }
   });
 }
 
@@ -138,7 +139,13 @@ async function startBot() {
         const body = m.message.conversation ||
           m.message.extendedTextMessage?.text ||
           m.message.buttonsResponseMessage?.selectedButtonId ||
-          m.message.listResponseMessage?.singleSelectReply?.selectedRowId || "";
+          m.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
+          (() => {
+            try {
+              const raw = m.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+              return raw ? (JSON.parse(raw).id || JSON.parse(raw).selected_id || "") : "";
+            } catch { return ""; }
+          })() || "";
         const choice = body.trim().toLowerCase();
 
         // Basic utility commands
@@ -222,4 +229,3 @@ app.get("/pair", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on ${PORT}`));
 startBot().catch(err => console.error("WhatsApp startup error:", err));
-
