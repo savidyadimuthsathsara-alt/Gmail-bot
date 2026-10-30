@@ -6,11 +6,14 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc.14",
     "better-sqlite3": "^11.0.0",
     "express": "^4.19.2",
-    "gifted-btns": "^1.0.2",
+    "gifted-btns": "^1.0.0",
     "pino": "^9.0.0",
     "telegram": "^2.22.2"
   }
