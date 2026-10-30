@@ -101,14 +101,11 @@ async function initTelegram() {
 
             let text = message.message || '';
 
-            // 🚨 මෙතන තමයි ඩොලර් අගය LKR 30 ලෙස වෙනස් වෙන්නේ
-            // උදාහරණයක් විදියට "from 0.18$ to 0.23$" වගේ එකක් ආවොත් ඒක "LKR 30.00" වෙනවා
+            // ඩොලර් අගය LKR 30 ලෙස වෙනස් කිරීම
             text = text.replace(/from\s*[\d.]+\$\s*to\s*[\d.]+\$/gi, "LKR 30.00");
-            // තනි $ ලකුණක් එක්ක එන අගයන් (උදා: 0.23$) LKR 30 වෙන්න
             text = text.replace(/[\d.]+(\$| USD)/gi, "LKR 30.00");
 
             if (text.includes('Register Gmail accounts') || text.includes('Email:') || text.includes('Password:')) {
-                // රෙජිස්ටර් වෙන මුල් මැසේජ් එකට අපේ බටන් දෙක දානවා
                 await sendButtons(sockInstance, waChatId, { 
                     text: text, 
                     buttons: [
@@ -143,7 +140,10 @@ async function initTelegram() {
 }
 
 async function sendToTg(waUserId, text, mediaBuffer = null) {
-    if (!tgClient) return;
+    if (!tgClient) {
+        console.log("❌ Telegram not connected, cannot send!");
+        return;
+    }
     waToTgMap.set(CONFIG.TG_BOT, waUserId);
     try {
         if (mediaBuffer) {
@@ -151,6 +151,7 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
         } else {
             await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
         }
+        console.log(`✅ Sent to Telegram: ${text}`);
     } catch (error) {
         console.log("Error sending to TG:", error.message);
     }
@@ -207,6 +208,7 @@ async function connectWhatsApp() {
 
             const from = msg.key.remoteJid;
             const sender = msg.key.participant || from;
+            
             const msgContent = normalizeMessageContent(msg.message) || msg.message;
             const type = Object.keys(msgContent)[0];
             const state = userStates.get(sender) || 'IDLE';
@@ -216,35 +218,97 @@ async function connectWhatsApp() {
                 return;
             }
 
+            // Debugging: පණිවිඩය එන වර්ගය පෙන්නන්න
+            console.log(`[NEW MESSAGE] Type: ${type}`);
+
+            let text = "";
             let btnId = null;
-            if (type === 'buttonsResponseMessage') {
+
+            if (type === 'conversation') {
+                text = msgContent.conversation;
+            } else if (type === 'extendedTextMessage') {
+                text = msgContent.extendedTextMessage.text;
+            } else if (type === 'buttonsResponseMessage') {
                 btnId = msgContent.buttonsResponseMessage.selectedButtonId;
+                text = msgContent.buttonsResponseMessage.selectedDisplayText;
             } else if (type === 'interactiveResponseMessage') {
                 const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
                 btnId = params.id;
+                text = params.display_text || btnId;
+            } else if (type === 'templateButtonReplyMessage') {
+                btnId = msgContent.templateButtonReplyMessage.selectedId;
+                text = msgContent.templateButtonReplyMessage.selectedDisplayText;
+            } else if (type === 'listResponseMessage') {
+                btnId = msgContent.listResponseMessage.singleSelectReply.selectedRowId;
+                text = msgContent.listResponseMessage.title;
             }
 
-            if (btnId) {
-                if (btnId === 'btn_register') {
+            // ==========================================
+            // 1. බටන් ඔබද්දි වැඩ කරන කොටස
+            // ==========================================
+            const processButton = async (id) => {
+                console.log(`👉 Button Action Triggered: ${id}`);
+                if (id === 'btn_register') {
                     await sendToTg(sender, '+ Register a new Gmail');
-                }
-                else if (btnId === 'btn_balance') {
+                } else if (id === 'btn_balance') {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
                     await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
-                }
-                else if (btnId === 'go_menu') {
+                } else if (id === 'go_menu') {
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
-                }
-                else if (btnId === 'btn_cancel') await sendToTg(sender, '/cancel');
-                else if (btnId === 'btn_done') await sendToTg(sender, '/done');
-                else if (btnId === 'btn_enable_2fa') await sendToTg(sender, 'Enable 2FA');
-                else if (btnId === 'btn_confirm_2fa') {
+                } else if (id === 'btn_cancel') {
+                    await sendToTg(sender, '/cancel');
+                } else if (id === 'btn_done') {
+                    await sendToTg(sender, '/done');
+                } else if (id === 'btn_enable_2fa') {
+                    await sendToTg(sender, 'Enable 2FA');
+                } else if (id === 'btn_confirm_2fa') {
                     userStates.set(sender, 'WAIT_QR');
                     await sendToTg(sender, '/confirm');
                 }
+            };
+
+            // Native Button එකක් නම්
+            if (btnId) {
+                await processButton(btnId);
                 return;
             }
 
+            // ෆෝන් එකෙන් බටන් එක Text විදියට එව්වොත් (Fallback)
+            if (text) {
+                const cleanText = text.trim().toLowerCase();
+                if (cleanText.includes('register gmail') || cleanText.includes('register a new gmail')) {
+                    await processButton('btn_register');
+                    return;
+                }
+                if (cleanText === '💰 balance' || cleanText === 'balance') {
+                    await processButton('btn_balance');
+                    return;
+                }
+                if (cleanText === '✔ done' || cleanText === 'done') {
+                    await processButton('btn_done');
+                    return;
+                }
+                if (cleanText.includes('cancel registration') || cleanText === 'cancel') {
+                    await processButton('btn_cancel');
+                    return;
+                }
+                if (cleanText.includes('enable 2fa')) {
+                    await processButton('btn_enable_2fa');
+                    return;
+                }
+                if (cleanText.includes('click again to confirm')) {
+                    await processButton('btn_confirm_2fa');
+                    return;
+                }
+                if (cleanText.includes('main menu') || cleanText === 'menu') {
+                    await processButton('go_menu');
+                    return;
+                }
+            }
+
+            // ==========================================
+            // 2. QR එක සහ 16 කෝඩ් එක අල්ලගන්නා කොටස
+            // ==========================================
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
@@ -253,23 +317,22 @@ async function connectWhatsApp() {
                 return;
             }
 
-            if (type === 'conversation' || type === 'extendedTextMessage') {
-                const text = msgContent.conversation || msgContent.extendedTextMessage?.text || '';
+            if (text && state === 'WAIT_CODE') {
+                await sendToTg(sender, text);
+                return;
+            }
+
+            // ==========================================
+            // 3. සාමාන්‍ය කමාන්ඩ්
+            // ==========================================
+            if (text) {
                 const cmd = text.trim().toLowerCase();
-
-                if (state === 'WAIT_CODE') {
-                    await sendToTg(sender, text);
-                    return;
-                }
-
                 if (cmd === '/start' || cmd === '.menu') {
                     userService.create(sender);
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
                 } 
-                else if (cmd === '.ping') await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
-                else if (cmd === 'balance') {
-                    let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
-                    await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+                else if (cmd === '.ping') {
+                    await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
                 }
             }
         });
