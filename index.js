@@ -222,3 +222,4 @@ app.get("/pair", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on ${PORT}`));
 startBot().catch(err => console.error("WhatsApp startup error:", err));
+
