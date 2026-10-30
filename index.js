@@ -15,6 +15,7 @@ const {
     DisconnectReason,
     Browsers,
     downloadMediaMessage,
+    normalizeMessageContent,
     fetchLatestWaWebVersion
 } = require("@whiskeysockets/baileys");
 
@@ -109,6 +110,9 @@ async function initTelegram() {
         console.log("✅ Telegram Connected!");
 
         tgClient.addEventHandler(async (event) => {
+            // 🚨 මේක තමයි අර Error එක ආව තැන හැදුවේ
+            if (!event.message) return; 
+
             const message = event.message;
             if (!message.message && !message.media) return;
 
@@ -160,22 +164,21 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
 }
 
 // ==========================================
-// 6. WhatsApp Bot Logic (ඔයාගේ වැඩ කරන බොට්ගේ සෙටින්ග්ස් වලින්)
+// 6. WhatsApp Bot Logic
 // ==========================================
 async function connectWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
         
-        // ඔයාගේ බොට් එකේ තියෙන විදියටම අලුත්ම Version එක ගන්නවා
         const { version } = await fetchLatestWaWebVersion().catch(() => ({ version: [2, 3000, 1038544855] }));
 
         sockInstance = makeWASocket({
             version,
             auth: state,
-            browser: Browsers.ubuntu("Chrome"), // 👈 ඔයාගේ බොට් එකේ තියෙන විදිය
+            browser: Browsers.ubuntu("Chrome"),
             printQRInTerminal: false,
             logger: pino({ level: 'silent' }),
-            markOnlineOnConnect: false // 👈 ඔයාගේ බොට් එකේ තියෙන විදිය
+            markOnlineOnConnect: false
         });
 
         if (!sockInstance.authState.creds.registered) {
@@ -220,7 +223,10 @@ async function connectWhatsApp() {
 
             const from = msg.key.remoteJid;
             const sender = msg.key.participant || from;
-            const type = Object.keys(msg.message)[0];
+            
+            // 🚨 මේක තමයි වැදගත්ම වෙනස්කම. බටන් එරර් එක අල්ලගන්න මේක දැම්මා
+            const msgContent = normalizeMessageContent(msg.message) || msg.message;
+            const type = Object.keys(msgContent)[0];
             const state = userStates.get(sender) || 'IDLE';
 
             if (from === 'status@broadcast') {
@@ -228,10 +234,22 @@ async function connectWhatsApp() {
                 return;
             }
 
-            if (type === 'buttonsResponseMessage' || type === 'interactiveResponseMessage') {
-                const btnId = msg.message.buttonsResponseMessage?.selectedButtonId 
-                           || JSON.parse(msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || '{}').id;
+            // බටන් ඔබද්දි එන හැම වර්ගයක්ම අල්ලගන්නවා
+            let btnId = null;
+            if (type === 'buttonsResponseMessage') {
+                btnId = msgContent.buttonsResponseMessage.selectedButtonId;
+            } else if (type === 'interactiveResponseMessage') {
+                const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
+                btnId = params.id;
+            } else if (type === 'templateButtonReplyMessage') {
+                btnId = msgContent.templateButtonReplyMessage.selectedId;
+            } else if (type === 'listResponseMessage') {
+                btnId = msgContent.listResponseMessage.singleSelectReply.selectedRowId;
+            }
 
+            // බටන් එකක් ඔබලා නම් මේක වැඩ කරනවා
+            if (btnId) {
+                console.log(`👉 Button Clicked: ${btnId}`); // ලොග්ස් වල පේන්න
                 if (btnId === 'btn_register') await sendToTg(sender, '/start');
                 else if (btnId === 'btn_balance') {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
@@ -250,6 +268,7 @@ async function connectWhatsApp() {
                 return;
             }
 
+            // ෆොටෝ එවනකොට (QR)
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
@@ -258,8 +277,9 @@ async function connectWhatsApp() {
                 return;
             }
 
+            // අකුරු එවනකොට
             if (type === 'conversation' || type === 'extendedTextMessage') {
-                const text = msg.message.conversation || msg.message.extendedTextMessage.text;
+                const text = msgContent.conversation || msgContent.extendedTextMessage?.text || '';
                 const cmd = text.trim().toLowerCase();
 
                 if (state === 'WAIT_CODE') {
