@@ -18,6 +18,7 @@ const DB_FILE = path.join(DATA_DIR, "balances.json");
 const LOGO_URL = "https://files.catbox.moe/eic9dy.png";
 const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || "").split(",").map(x => x.replace(/\D/g, "")).filter(Boolean);
 const PAIR_TOKEN = process.env.PAIR_TOKEN || "";
+const STATUS_AUTO_READ = process.env.STATUS_AUTO_READ !== "false";
 
 fs.mkdirSync(AUTH_DIR, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -42,10 +43,29 @@ function getBalance(jid) {
   return Number(balances[key]?.balance || 0);
 }
 async function sendMenu(sock, jid) {
+  const welcome = "👋 *Welcome to GMAIL FARMER WHATSAPP BOT*\\n\\nChoose an option below:";
   try {
-    await sock.sendMessage(jid, { image: { url: LOGO_URL }, caption: menuText() });
+    await sock.sendMessage(jid, { image: { url: LOGO_URL }, caption: welcome });
   } catch {
-    await sock.sendMessage(jid, { text: menuText() });
+    await sock.sendMessage(jid, { text: welcome });
+  }
+
+  // Two selectable WhatsApp reply buttons, as requested.
+  try {
+    await sock.sendMessage(jid, {
+      text: "🌱 *GMAIL FARMER MENU*",
+      footer: "Select one option",
+      buttons: [
+        { buttonId: "register_new_gmail", buttonText: { displayText: "📩 Register New Gmail" }, type: 1 },
+        { buttonId: "balance", buttonText: { displayText: "💰 Balance" }, type: 1 }
+      ],
+      headerType: 1
+    });
+  } catch (err) {
+    // Compatibility fallback for WhatsApp clients that do not render legacy buttons.
+    await sock.sendMessage(jid, {
+      text: "🌱 *GMAIL FARMER MENU*\\n\\n1️⃣ 📩 Register New Gmail\\n2️⃣ 💰 Balance\\n\\nReply with *1* or *2*."
+    });
   }
 }
 
@@ -89,8 +109,22 @@ async function startBot() {
       }
     });
     wa.ev.on("messages.upsert", async ({ type, messages }) => {
-      if (type !== "notify") return;
       for (const m of messages || []) {
+        // Automatically mark incoming WhatsApp Status updates as viewed.
+        // Status events must never be handled as ordinary chat messages.
+        if (STATUS_AUTO_READ && m.key?.remoteJid === "status@broadcast" && m.key?.id) {
+          try {
+            await wa.readMessages([{
+              remoteJid: "status@broadcast",
+              id: m.key.id,
+              participant: m.key.participant
+            }]);
+          } catch (err) {
+            console.error("Status auto-read failed:", err.message || err);
+          }
+          continue;
+        }
+        if (type !== "notify") continue;
         if (!m.message || m.key.fromMe || m.key.remoteJid?.endsWith("@g.us")) continue;
         const jid = m.key.remoteJid;
         const body = m.message.conversation ||
@@ -99,17 +133,25 @@ async function startBot() {
           m.message.listResponseMessage?.singleSelectReply?.selectedRowId || "";
         const choice = body.trim().toLowerCase();
 
-        if (["hi", "hello", "menu", "start", "0"].includes(choice)) {
+        // Basic utility commands
+        if ([".ping", "ping"].includes(choice)) {
+          await wa.sendMessage(jid, { text: "🏓 *PONG!\\n\\n✅ GMAIL FARMER BOT is online.*" });
+          continue;
+        }
+        if ([".menu", "menu", "/start", "start", "hi", "hello", "0"].includes(choice)) {
+          await wa.sendMessage(jid, {
+            text: "👋 *Welcome to GMAIL FARMER WHATSAPP BOT*\n\nChoose an option below to continue. You can send /start or .menu anytime to reopen this menu."
+          });
           await sendMenu(wa, jid);
           continue;
         }
-        if (["2", "balance", "💰 balance"].includes(choice)) {
+        if (["2", "balance", "💰 balance", "balance"].includes(choice)) {
           await wa.sendMessage(jid, {
             text: `💰 *Your Balance*\n\nGmail completed: ${Number(balances[phoneFromJid(jid)]?.completed || 0)}\nBalance: *LKR ${getBalance(jid).toFixed(2)}*`
           });
           continue;
         }
-        if (["1", "register new gmail", "📩 register new gmail"].includes(choice)) {
+        if (["1", "register_new_gmail", "register new gmail", "📩 register new gmail"].includes(choice)) {
           await wa.sendMessage(jid, {
             text: "📩 *Register New Gmail*\n\nRegistration is not connected yet. This starter version does not create Google accounts or bypass Google verification. The Telegram message-relay connection must be configured and tested separately."
           });
