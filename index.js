@@ -79,7 +79,7 @@ app.get('/api/dashboard', (req, res) => {
 app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard running on port ${CONFIG.PORT}`));
 
 // ==========================================
-// Telegram Relay Logic
+// Telegram Relay Logic (Updated)
 // ==========================================
 async function initTelegram() {
     if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) return;
@@ -90,16 +90,16 @@ async function initTelegram() {
         await tgClient.connect();
         console.log("✅ Telegram Connected!");
 
+        // ටෙලිග්‍රෑම් එකෙන් එන අලුත් මැසේජ් සහ Edit වෙන මැසේජ් අල්ලගන්නවා
         tgClient.addEventHandler(async (event) => {
-            if (!event.message) return; 
-
             const message = event.message;
-            if (!message.message && !message.media) return;
+            if (!message) return;
 
             const waChatId = waToTgMap.get(CONFIG.TG_BOT);
             if (!waChatId) return;
 
-            let text = message.message || '';
+            let text = message.message || message.text || '';
+            if (!text && !message.media) return;
 
             // ඩොලර් අගය LKR 30 ලෙස වෙනස් කිරීම
             text = text.replace(/from\s*[\d.]+\$\s*to\s*[\d.]+\$/gi, "LKR 30.00");
@@ -130,20 +130,46 @@ async function initTelegram() {
             else if (text.includes('CLICK AGAIN TO CONFIRM')) {
                 await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_confirm_2fa', text: '[‼️ CLICK AGAIN TO CONFIRM ‼️]' }] });
             } 
-            else {
+            else if (text.trim() !== '') {
                 await sockInstance.sendMessage(waChatId, { text: text });
             }
-        });
+        }, { chats: [CONFIG.TG_BOT] }); // අදාළ බොට් එකේ මැසේජ් විතරක් ගන්නවා
+
     } catch (error) {
         console.error("Telegram Error:", error);
     }
 }
 
-async function sendToTg(waUserId, text, mediaBuffer = null) {
-    if (!tgClient) {
-        console.log("❌ Telegram not connected, cannot send!");
-        return;
+// ටෙලිග්‍රෑම් බටන් එකක් ක්ලික් කරන ෆන්ක්ෂන් එක
+async function clickTelegramButton(btnText) {
+    if (!tgClient) return;
+    try {
+        // අන්තිම මැසේජ් 10 අරගෙන ඒවායේ බටන් තියෙනවද බලනවා
+        const messages = await tgClient.getMessages(CONFIG.TG_BOT, { limit: 10 });
+        for (const msg of messages) {
+            if (msg.replyMarkup && msg.replyMarkup.rows) {
+                // ඔක්කොම බටන් ටික එකට ගන්නවා
+                const allButtons = msg.replyMarkup.rows.flatMap(row => row.buttons);
+                // අපේ බටන් එක හොයනවා
+                const targetBtn = allButtons.find(b => b.text.includes(btnText) || btnText.includes(b.text));
+                
+                if (targetBtn) {
+                    console.log(`👉 Clicking TG Button: ${targetBtn.text}`);
+                    await msg.click({ text: targetBtn.text });
+                    return true;
+                }
+            }
+        }
+        console.log(`❌ Button not found in TG: ${btnText}`);
+        return false;
+    } catch (e) {
+        console.log("Error clicking button:", e.message);
+        return false;
     }
+}
+
+async function sendToTg(waUserId, text, mediaBuffer = null) {
+    if (!tgClient) return;
     waToTgMap.set(CONFIG.TG_BOT, waUserId);
     try {
         if (mediaBuffer) {
@@ -151,7 +177,6 @@ async function sendToTg(waUserId, text, mediaBuffer = null) {
         } else {
             await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
         }
-        console.log(`✅ Sent to Telegram: ${text}`);
     } catch (error) {
         console.log("Error sending to TG:", error.message);
     }
@@ -218,97 +243,70 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // Debugging: පණිවිඩය එන වර්ගය පෙන්නන්න
-            console.log(`[NEW MESSAGE] Type: ${type}`);
-
             let text = "";
             let btnId = null;
 
-            if (type === 'conversation') {
-                text = msgContent.conversation;
-            } else if (type === 'extendedTextMessage') {
-                text = msgContent.extendedTextMessage.text;
-            } else if (type === 'buttonsResponseMessage') {
+            if (type === 'conversation') text = msgContent.conversation;
+            else if (type === 'extendedTextMessage') text = msgContent.extendedTextMessage.text;
+            else if (type === 'buttonsResponseMessage') {
                 btnId = msgContent.buttonsResponseMessage.selectedButtonId;
                 text = msgContent.buttonsResponseMessage.selectedDisplayText;
             } else if (type === 'interactiveResponseMessage') {
                 const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
                 btnId = params.id;
                 text = params.display_text || btnId;
-            } else if (type === 'templateButtonReplyMessage') {
-                btnId = msgContent.templateButtonReplyMessage.selectedId;
-                text = msgContent.templateButtonReplyMessage.selectedDisplayText;
-            } else if (type === 'listResponseMessage') {
-                btnId = msgContent.listResponseMessage.singleSelectReply.selectedRowId;
-                text = msgContent.listResponseMessage.title;
             }
 
-            // ==========================================
-            // 1. බටන් ඔබද්දි වැඩ කරන කොටස
-            // ==========================================
             const processButton = async (id) => {
-                console.log(`👉 Button Action Triggered: ${id}`);
                 if (id === 'btn_register') {
-                    await sendToTg(sender, '+ Register a new Gmail');
-                } else if (id === 'btn_balance') {
+                    // 🚨 අලුත් ක්‍රමය: අකුරු යවන්නේ නෑ, බටන් එක ක්ලික් කරනවා
+                    const clicked = await clickTelegramButton('Register a new Gmail');
+                    if (!clicked) await sendToTg(sender, '+ Register a new Gmail'); // Fallback
+                } 
+                else if (id === 'btn_balance') {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
                     await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
-                } else if (id === 'go_menu') {
+                } 
+                else if (id === 'go_menu') {
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
-                } else if (id === 'btn_cancel') {
-                    await sendToTg(sender, '/cancel');
-                } else if (id === 'btn_done') {
-                    await sendToTg(sender, '/done');
-                } else if (id === 'btn_enable_2fa') {
-                    await sendToTg(sender, 'Enable 2FA');
-                } else if (id === 'btn_confirm_2fa') {
+                } 
+                else if (id === 'btn_cancel') {
+                    const clicked = await clickTelegramButton('Cancel');
+                    if (!clicked) await sendToTg(sender, '/cancel');
+                } 
+                else if (id === 'btn_done') {
+                    const clicked = await clickTelegramButton('Done');
+                    if (!clicked) await sendToTg(sender, '/done');
+                } 
+                else if (id === 'btn_enable_2fa') {
+                    const clicked = await clickTelegramButton('Enable 2FA');
+                    if (!clicked) await sendToTg(sender, 'Enable 2FA');
+                } 
+                else if (id === 'btn_confirm_2fa') {
                     userStates.set(sender, 'WAIT_QR');
-                    await sendToTg(sender, '/confirm');
+                    const clicked = await clickTelegramButton('CLICK AGAIN TO CONFIRM');
+                    if (!clicked) await sendToTg(sender, '/confirm');
                 }
             };
 
-            // Native Button එකක් නම්
             if (btnId) {
                 await processButton(btnId);
                 return;
             }
 
-            // ෆෝන් එකෙන් බටන් එක Text විදියට එව්වොත් (Fallback)
+            // ෆෝන් එකෙන් Text විදියට ආවොත් (Fallback)
             if (text) {
                 const cleanText = text.trim().toLowerCase();
-                if (cleanText.includes('register gmail') || cleanText.includes('register a new gmail')) {
-                    await processButton('btn_register');
-                    return;
-                }
-                if (cleanText === '💰 balance' || cleanText === 'balance') {
-                    await processButton('btn_balance');
-                    return;
-                }
-                if (cleanText === '✔ done' || cleanText === 'done') {
-                    await processButton('btn_done');
-                    return;
-                }
-                if (cleanText.includes('cancel registration') || cleanText === 'cancel') {
-                    await processButton('btn_cancel');
-                    return;
-                }
-                if (cleanText.includes('enable 2fa')) {
-                    await processButton('btn_enable_2fa');
-                    return;
-                }
-                if (cleanText.includes('click again to confirm')) {
-                    await processButton('btn_confirm_2fa');
-                    return;
-                }
-                if (cleanText.includes('main menu') || cleanText === 'menu') {
-                    await processButton('go_menu');
-                    return;
-                }
+                if (cleanText.includes('register gmail') || cleanText.includes('register a new gmail')) return await processButton('btn_register');
+                if (cleanText === '💰 balance' || cleanText === 'balance') return await processButton('btn_balance');
+                if (cleanText === '✔ done' || cleanText === 'done') return await processButton('btn_done');
+                if (cleanText.includes('cancel registration') || cleanText === 'cancel') return await processButton('btn_cancel');
+                if (cleanText.includes('enable 2fa')) return await processButton('btn_enable_2fa');
+                if (cleanText.includes('click again to confirm')) return await processButton('btn_confirm_2fa');
+                if (cleanText.includes('main menu') || cleanText === 'menu') return await processButton('go_menu');
             }
 
-            // ==========================================
-            // 2. QR එක සහ 16 කෝඩ් එක අල්ලගන්නා කොටස
-            // ==========================================
+            // QR සහ 16 කෝඩ් එක
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
@@ -322,16 +320,13 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // ==========================================
-            // 3. සාමාන්‍ය කමාන්ඩ්
-            // ==========================================
+            // කමාන්ඩ්ස්
             if (text) {
                 const cmd = text.trim().toLowerCase();
                 if (cmd === '/start' || cmd === '.menu') {
                     userService.create(sender);
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
-                } 
-                else if (cmd === '.ping') {
+                } else if (cmd === '.ping') {
                     await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
                 }
             }
