@@ -1,231 +1,276 @@
-"use strict";
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, downloadMediaMessage } from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import express from 'express';
+import pino from 'pino';
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { sendButtons } from 'gifted-btns';
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions/index.js";
 
-const express = require("express");
-const pino = require("pino");
-const fs = require("fs");
-const path = require("path");
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  Browsers
-} = require("@whiskeysockets/baileys");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
-const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, "data");
-const AUTH_DIR = path.join(DATA_DIR, "auth");
-const DB_FILE = path.join(DATA_DIR, "balances.json");
-const LOGO_URL = "https://files.catbox.moe/eic9dy.png";
-const ADMIN_NUMBERS = (process.env.ADMIN_NUMBERS || "").split(",").map(x => x.replace(/\D/g, "")).filter(Boolean);
-const PAIR_TOKEN = process.env.PAIR_TOKEN || "";
-const STATUS_AUTO_READ = process.env.STATUS_AUTO_READ !== "false";
+// ==========================================
+// 1. Configuration (Railway Environment Variables)
+// ==========================================
+const CONFIG = {
+    PORT: process.env.PORT || 3000,
+    DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD || "admin123", 
+    BOT_PHONE_NUMBER: process.env.BOT_PHONE_NUMBER || "94771234567", 
+    REWARD: 30, // රු. 30
+    
+    TG_API_ID: parseInt(process.env.TG_API_ID || "0"),
+    TG_API_HASH: process.env.TG_API_HASH || "",
+    TG_SESSION: process.env.TG_SESSION || "", 
+    TG_BOT: process.env.TG_BOT || "@GmailFarmerBot" 
+};
 
-fs.mkdirSync(AUTH_DIR, { recursive: true });
-fs.mkdirSync(DATA_DIR, { recursive: true });
+const LOGO_URL = 'https://files.catbox.moe/eic9dy.png';
 
-function readBalances() {
-  try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); }
-  catch { return {}; }
-}
-let balances = readBalances();
-function saveBalances() {
-  const tmp = DB_FILE + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(balances, null, 2));
-  fs.renameSync(tmp, DB_FILE);
-}
-function phoneFromJid(jid) { return String(jid || "").split("@")[0].replace(/\D/g, ""); }
-function isAdmin(jid) { return ADMIN_NUMBERS.includes(phoneFromJid(jid)); }
-function menuText() {
-  return `🌱 *GMAIL FARMER WHATSAPP BOT*\n\n📩 1. Register New Gmail\n💰 2. Balance\n\nReply with *1* or *2*.`;
-}
-function getBalance(jid) {
-  const key = phoneFromJid(jid);
-  return Number(balances[key]?.balance || 0);
-}
-async function sendMenu(sock, jid) {
-  const welcome = "👋 *Welcome to GMAIL FARMER WHATSAPP BOT*\\n\\nChoose an option below:";
-  try {
-    await sock.sendMessage(jid, { image: { url: LOGO_URL }, caption: welcome });
-  } catch {
-    await sock.sendMessage(jid, { text: welcome });
-  }
+// ==========================================
+// 2. Database Setup (SQLite)
+// ==========================================
+const dataDir = path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const db = new Database(path.join(dataDir, 'bot.db'));
+db.pragma('journal_mode = WAL');
 
-  // Baileys v7 native-flow quick-reply buttons.
-  await sock.sendMessage(jid, {
-    interactiveMessage: {
-      header: { title: "🌱 GMAIL FARMER" },
-      body: { text: "Select an option to continue:" },
-      footer: { text: "GMAIL FARMER WHATSAPP BOT" },
-      nativeFlowMessage: {
-        buttons: [
-          {
-            name: "quick_reply",
-            buttonParamsJson: JSON.stringify({
-              display_text: "📩 Register New Gmail",
-              id: "register_new_gmail"
-            })
-          },
-          {
-            name: "quick_reply",
-            buttonParamsJson: JSON.stringify({
-              display_text: "💰 Balance",
-              id: "balance"
-            })
-          }
-        ]
-      }
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY, balance REAL DEFAULT 0, tasks_completed INTEGER DEFAULT 0
+  );
+  CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY, user_id TEXT, amount REAL
+  );
+`);
+
+const userService = {
+    find: (id) => db.prepare('SELECT * FROM users WHERE id = ?').get(id),
+    create: (id) => db.prepare('INSERT OR IGNORE INTO users (id) VALUES (?)').run(id),
+    addBalance: (id, amt) => db.prepare('UPDATE users SET balance = balance + ?, tasks_completed = tasks_completed + 1 WHERE id = ?').run(amt, id),
+    getAll: () => db.prepare('SELECT * FROM users').all(),
+};
+
+const taskService = {
+    add: (taskId, userId, amount) => {
+        try { 
+            db.prepare('INSERT INTO tasks (task_id, user_id, amount) VALUES (?, ?, ?)').run(taskId, userId, amount); 
+            return true; 
+        } catch (e) { 
+            return false; // Duplicate task
+        }
     }
-  });
-}
+};
 
-let sock;
-let startPromise;
-let pendingPhone = null;
-let pairingResult = null;
-let pairingError = null;
-let pairingPromise = null;
+// ==========================================
+// 3. State Management
+// ==========================================
+let currentPairingCode = null;
+let waStatus = 'offline';
+let sockInstance = null;
+let tgClient = null;
+const userStates = new Map(); // WhatsApp user step (WAIT_QR, WAIT_CODE)
+const waToTgMap = new Map();  // Map WhatsApp User to Telegram
 
-async function startBot() {
-  if (startPromise) return startPromise;
-  startPromise = (async () => {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-    const wa = makeWASocket({
-      auth: state,
-      logger: pino({ level: process.env.LOG_LEVEL || "info" }),
-      browser: Browsers.ubuntu("Chrome"),
-      printQRInTerminal: false,
-      markOnlineOnConnect: false
-    });
-    wa.ev.on("creds.update", saveCreds);
-    wa.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
-      if (qr && pendingPhone && !pairingResult && !pairingError) {
-        try {
-          const raw = await wa.requestPairingCode(pendingPhone);
-          pairingResult = String(raw).match(/.{1,4}/g)?.join("-") || String(raw);
-        } catch (e) {
-          pairingError = e.message || "Pairing code request failed";
-        } finally {
-          pendingPhone = null;
-        }
-      }
-      if (connection === "open") console.log("WhatsApp connected:", wa.user?.id || "connected");
-      if (connection === "close") {
-        sock = null;
-        const code = lastDisconnect?.error?.output?.statusCode;
-        if (code !== DisconnectReason.loggedOut) {
-          setTimeout(() => startBot().catch(console.error), 5000);
-        }
-      }
-    });
-    wa.ev.on("messages.upsert", async ({ type, messages }) => {
-      for (const m of messages || []) {
-        // Automatically mark incoming WhatsApp Status updates as viewed.
-        // Status events must never be handled as ordinary chat messages.
-        if (STATUS_AUTO_READ && m.key?.remoteJid === "status@broadcast" && m.key?.id) {
-          try {
-            await wa.readMessages([{
-              remoteJid: "status@broadcast",
-              id: m.key.id,
-              participant: m.key.participant
-            }]);
-          } catch (err) {
-            console.error("Status auto-read failed:", err.message || err);
-          }
-          continue;
-        }
-        if (type !== "notify") continue;
-        if (!m.message || m.key.fromMe || m.key.remoteJid?.endsWith("@g.us")) continue;
-        const jid = m.key.remoteJid;
-        const body = m.message.conversation ||
-          m.message.extendedTextMessage?.text ||
-          m.message.buttonsResponseMessage?.selectedButtonId ||
-          m.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
-          (() => {
-            try {
-              const raw = m.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
-              return raw ? (JSON.parse(raw).id || JSON.parse(raw).selected_id || "") : "";
-            } catch { return ""; }
-          })() || "";
-        const choice = body.trim().toLowerCase();
-
-        // Basic utility commands
-        if ([".ping", "ping"].includes(choice)) {
-          await wa.sendMessage(jid, { text: "🏓 *PONG!\\n\\n✅ GMAIL FARMER BOT is online.*" });
-          continue;
-        }
-        if ([".menu", "menu", "/start", "start", "hi", "hello", "0"].includes(choice)) {
-          await wa.sendMessage(jid, {
-            text: "👋 *Welcome to GMAIL FARMER WHATSAPP BOT*\n\nChoose an option below to continue. You can send /start or .menu anytime to reopen this menu."
-          });
-          await sendMenu(wa, jid);
-          continue;
-        }
-        if (["2", "balance", "💰 balance", "balance"].includes(choice)) {
-          await wa.sendMessage(jid, {
-            text: `💰 *Your Balance*\n\nGmail completed: ${Number(balances[phoneFromJid(jid)]?.completed || 0)}\nBalance: *LKR ${getBalance(jid).toFixed(2)}*`
-          });
-          continue;
-        }
-        if (["1", "register_new_gmail", "register new gmail", "📩 register new gmail"].includes(choice)) {
-          await wa.sendMessage(jid, {
-            text: "📩 *Register New Gmail*\n\nRegistration is not connected yet. This starter version does not create Google accounts or bypass Google verification. The Telegram message-relay connection must be configured and tested separately."
-          });
-          continue;
-        }
-        if (isAdmin(jid) && choice.startsWith("!credit ")) {
-          const parts = choice.split(/\\s+/);
-          const target = (parts[1] || "").replace(/\D/g, "");
-          const count = Math.max(0, Math.floor(Number(parts[2] || 0)));
-          if (!target || !count) {
-            await wa.sendMessage(jid, { text: "Use: !credit 947XXXXXXXX 1" });
-            continue;
-          }
-          const entry = balances[target] || { completed: 0, balance: 0 };
-          entry.completed += count;
-          entry.balance += count * 30;
-          balances[target] = entry;
-          saveBalances();
-          await wa.sendMessage(jid, { text: `Added LKR ${(count * 30).toFixed(2)} to ${target}.` });
-          continue;
-        }
-        await sendMenu(wa, jid);
-      }
-    });
-    return wa;
-  })();
-  try { sock = await startPromise; return sock; }
-  finally { startPromise = null; }
-}
-
+// ==========================================
+// 4. Express Server (Admin Dashboard)
+// ==========================================
 const app = express();
-app.get("/", (_req, res) => res.sendFile(path.join(__dirname, "index.html")));
-app.get("/pair", async (req, res) => {
-  if (!PAIR_TOKEN || req.query.token !== PAIR_TOKEN) return res.status(401).json({ ok: false, error: "Unauthorized" });
-  const phone = String(req.query.phone || "").replace(/\D/g, "");
-  if (!/^[1-9]\d{7,14}$/.test(phone)) return res.status(400).json({ ok: false, error: "Enter phone number with country code, digits only." });
-  try {
-    const wa = sock || await startBot();
-    if (wa.user) return res.json({ ok: true, connected: true });
-    if (pairingPromise) return res.status(409).json({ ok: false, error: "Pairing request already running." });
-    pairingPromise = (async () => {
-      pendingPhone = phone;
-      pairingResult = null;
-      pairingError = null;
-      for (let i = 0; i < 40; i++) {
-        if (pairingResult) return pairingResult;
-        if (pairingError) throw new Error(pairingError);
-        await new Promise(r => setTimeout(r, 500));
-      }
-      throw new Error("Pairing timed out. Try again.");
-    })();
-    const code = await pairingPromise;
-    return res.json({ ok: true, code });
-  } catch (e) {
-    return res.status(503).json({ ok: false, error: e.message });
-  } finally {
-    pairingPromise = null;
-  }
-});
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-app.listen(PORT, "0.0.0.0", () => console.log(`HTTP server listening on ${PORT}`));
-startBot().catch(err => console.error("WhatsApp startup error:", err));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/api/dashboard', (req, res) => {
+    res.json({
+        status: waStatus,
+        pairingCode: currentPairingCode,
+        users: userService.getAll()
+    });
+});
+app.listen(CONFIG.PORT, () => console.log(`🌐 Dashboard: http://localhost:${CONFIG.PORT}`));
+
+// ==========================================
+// 5. Telegram Relay Logic
+// ==========================================
+async function initTelegram() {
+    if (!CONFIG.TG_SESSION || CONFIG.TG_API_ID === 0) {
+        console.log("⚠️ Telegram Config missing. Bot will run without Telegram.");
+        return;
+    }
+    
+    try {
+        const session = new StringSession(CONFIG.TG_SESSION);
+        tgClient = new TelegramClient(session, CONFIG.TG_API_ID, CONFIG.TG_API_HASH, { connectionRetries: 5 });
+        await tgClient.connect();
+        console.log("✅ Telegram Connected!");
+
+        tgClient.addEventHandler(async (event) => {
+            const message = event.message;
+            if (!message.message && !message.media) return;
+
+            const waChatId = waToTgMap.get(CONFIG.TG_BOT);
+            if (!waChatId) return;
+
+            const text = message.message || '';
+
+            // සාර්ථක මැසේජ් එකක් ආවොත් බැලන්ස් එක එකතු කිරීම
+            if (text.includes('Success') || text.includes('created successfully')) {
+                const taskId = `task_${Date.now()}_${waChatId}`;
+                if (taskService.add(taskId, waChatId, CONFIG.REWARD)) {
+                    userService.addBalance(waChatId, CONFIG.REWARD);
+                    const user = userService.find(waChatId);
+                    const msg = `✅ *Gmail එක සාර්ථකව හැදුවා!*\n\n💰 රු. ${CONFIG.REWARD}.00 ක් එකතු කරන ලදී.\n💵 *නව බැලන්ස්:* රු. ${user.balance.toFixed(2)}\n📊 *Tasks:* ${user.tasks_completed}`;
+                    await sendButtons(sockInstance, waChatId, { text: msg, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+                }
+                userStates.delete(waChatId);
+            } 
+            else if (text.includes('Done') || text.includes('Cancel') || text.includes('registration')) {
+                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_done', text: '✔ Done' }, { id: 'btn_cancel', text: '🚫 Cancel registration' }] });
+            } 
+            else if (text.includes('Enable 2FA')) {
+                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA (0.23$)' }] });
+            } 
+            else if (text.includes('CLICK AGAIN TO CONFIRM')) {
+                await sendButtons(sockInstance, waChatId, { text, buttons: [{ id: 'btn_confirm_2fa', text: '[‼️ CLICK AGAIN TO CONFIRM ‼️]' }] });
+            } 
+            else if (text.toLowerCase().includes('qr')) {
+                await sockInstance.sendMessage(waChatId, { text: text });
+            } 
+            else {
+                await sockInstance.sendMessage(waChatId, { text: text });
+            }
+        });
+    } catch (error) {
+        console.error("Telegram Error:", error);
+    }
+}
+
+async function sendToTg(waUserId, text, mediaBuffer = null) {
+    if (!tgClient) return;
+    waToTgMap.set(CONFIG.TG_BOT, waUserId);
+    try {
+        if (mediaBuffer) {
+            await tgClient.sendFile(CONFIG.TG_BOT, { file: mediaBuffer, caption: text });
+        } else {
+            await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
+        }
+    } catch (error) {
+        console.log("Error sending to TG:", error.message);
+    }
+}
+
+// ==========================================
+// 6. WhatsApp Bot Logic (Baileys)
+// ==========================================
+async function connectWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState(path.join(dataDir, 'auth_info'));
+    
+    sockInstance = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }),
+        browser: ['Gmail Farmer', 'Chrome', '1.0.0']
+    });
+
+    if (!sockInstance.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                const code = await sockInstance.requestPairingCode(CONFIG.BOT_PHONE_NUMBER.replace(/[^0-9]/g, ''));
+                currentPairingCode = code;
+                console.log(`🔑 Pairing Code: ${code}`);
+            } catch (err) { console.log("Pairing Code Error:", err.message); }
+        }, 5000);
+    }
+
+    sockInstance.ev.on('creds.update', saveCreds);
+
+    sockInstance.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            waStatus = 'offline';
+            currentPairingCode = null;
+            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) connectWhatsApp();
+        } else if (connection === 'open') {
+            waStatus = 'connected';
+            currentPairingCode = null;
+            console.log('✅ WhatsApp Connected!');
+            initTelegram();
+        }
+    });
+
+    sockInstance.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const from = msg.key.remoteJid;
+        const sender = msg.key.participant || from;
+        const type = Object.keys(msg.message)[0];
+        const state = userStates.get(sender) || 'IDLE';
+
+        // Auto Read Status
+        if (from === 'status@broadcast') {
+            await sockInstance.readMessages([msg.key]);
+            return;
+        }
+
+        // --- Handle Buttons ---
+        if (type === 'buttonsResponseMessage' || type === 'interactiveResponseMessage') {
+            const btnId = msg.message.buttonsResponseMessage?.selectedButtonId 
+                       || JSON.parse(msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || '{}').id;
+
+            if (btnId === 'btn_register') await sendToTg(sender, '/start');
+            else if (btnId === 'btn_balance') {
+                let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
+                await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+            }
+            else if (btnId === 'go_menu') {
+                await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
+            }
+            else if (btnId === 'btn_cancel') await sendToTg(sender, 'Cancel');
+            else if (btnId === 'btn_done') await sendToTg(sender, 'Done');
+            else if (btnId === 'btn_enable_2fa') await sendToTg(sender, 'Enable 2FA');
+            else if (btnId === 'btn_confirm_2fa') {
+                userStates.set(sender, 'WAIT_QR');
+                await sendToTg(sender, 'Confirm');
+            }
+            return;
+        }
+
+        // --- Handle QR Image ---
+        if (type === 'imageMessage' && state === 'WAIT_QR') {
+            const buffer = await downloadMediaMessage(msg, 'buffer', {});
+            await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
+            userStates.set(sender, 'WAIT_CODE');
+            await sockInstance.sendMessage(from, { text: '✅ QR Code එක ලැබුණා. දැන් ඔබට ලැබුණු අකුරු 16ේ කෝඩ් එක එවන්න.' });
+            return;
+        }
+
+        // --- Handle Text (Commands & 16-Char Code) ---
+        if (type === 'conversation' || type === 'extendedTextMessage') {
+            const text = msg.message.conversation || msg.message.extendedTextMessage.text;
+            const cmd = text.trim().toLowerCase();
+
+            if (state === 'WAIT_CODE') {
+                await sendToTg(sender, text);
+                return;
+            }
+
+            if (cmd === '/start' || cmd === '.menu') {
+                userService.create(sender);
+                await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
+            } 
+            else if (cmd === '.ping') await sockInstance.sendMessage(from, { text: '🏓 Pong! Bot is online.' });
+            else if (cmd === 'balance') {
+                let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
+                await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
+            }
+        }
+    });
+}
+
+// Start the bot
+connectWhatsApp();
