@@ -11,9 +11,10 @@ const { StringSession } = require("telegram/sessions");
 const {
     default: makeWASocket,
     useMultiFileAuthState,
-    DisconnectReason, // මේක දැන් හරියට import වෙනවා
+    DisconnectReason,
     Browsers,
     downloadMediaMessage,
+    normalizeMessageContent,
     getContentType,
     fetchLatestWaWebVersion
 } = require("@whiskeysockets/baileys");
@@ -67,7 +68,7 @@ let sockInstance = null;
 let tgClient = null;
 const userStates = new Map(); 
 
-let requestQueue = []; 
+// දැනට ටෙලිග්‍රෑම් එකේ වැඩ කරන කෙනා
 let activeTelegramUser = null; 
 
 const app = express();
@@ -95,24 +96,21 @@ async function initTelegram() {
         tgClient.addEventHandler(async (event) => {
             const message = event.message;
             if (!message) return;
+            
+            // අපේ යූසර් කෙනෙක් වැඩ කරනවා නම් විතරක් ඩේටා ගන්නවා
             if (!activeTelegramUser) return;
 
             let text = message.message || message.text || '';
             if (!text && !message.media) return;
 
-            const isRelevant = /Register Gmail|Email|Password|Success|created|Enable 2FA|CLICK AGAIN|QR|Confirm|Done|Cancel/i.test(text) || message.media;
-            if (!isRelevant) return; 
+            // අදාළ වචන තියෙනවද බලනවා (අනවශ්‍ය මැසේජ් අයින් කරන්න)
+            const hasData = /First name:|Email:|Password:|Success|created|Enable 2FA|CLICK AGAIN/i.test(text) || message.media;
+            if (!hasData) return; 
 
+            // ඩොලර් අගය LKR 30 ලෙස වෙනස් කිරීම
             text = text.replace(/from\s*[\d.]+\$\s*to\s*[\d.]+\$/gi, "LKR 30.00");
-            text = text.replace(/[\d.]+(\$| USD)/gi, "LKR 30.00");
 
-            if (text.includes('too often')) {
-                await sockInstance.sendMessage(activeTelegramUser, { text: "⚠️ කරුණාකර තත්පර 30ක් රැඳී සිට නැවත උත්සාහ කරන්න. (Telegram Rate Limit)" });
-                processNextInQueue();
-                return;
-            }
-
-            if (text.includes('Register Gmail accounts') || text.includes('Email:') || text.includes('Password:')) {
+            if (text.includes('First name:') || text.includes('Email:')) {
                 await sendButtons(sockInstance, activeTelegramUser, { 
                     text: text, 
                     buttons: [
@@ -130,7 +128,7 @@ async function initTelegram() {
                     await sendButtons(sockInstance, activeTelegramUser, { text: msg, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
                 }
                 userStates.delete(activeTelegramUser);
-                processNextInQueue();
+                activeTelegramUser = null; // වැඩේ ඉවරයි, ලොක් එක අයින් කරනවා
             } 
             else if (text.includes('Enable 2FA')) {
                 await sendButtons(sockInstance, activeTelegramUser, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA' }] });
@@ -138,7 +136,7 @@ async function initTelegram() {
             else if (text.includes('CLICK AGAIN TO CONFIRM')) {
                 await sendButtons(sockInstance, activeTelegramUser, { text, buttons: [{ id: 'btn_confirm_2fa', text: '[‼️ CLICK AGAIN TO CONFIRM ‼️]' }] });
             } 
-            else if (text.trim() !== '') {
+            else {
                 await sockInstance.sendMessage(activeTelegramUser, { text: text });
             }
         }, { chats: [CONFIG.TG_BOT] });
@@ -148,29 +146,13 @@ async function initTelegram() {
     }
 }
 
-async function processNextInQueue() {
-    activeTelegramUser = null;
-    if (requestQueue.length > 0) {
-        const nextUser = requestQueue.shift();
-        activeTelegramUser = nextUser;
-        
-        await sockInstance.sendMessage(nextUser, { text: "🔄 ඔබගේ වාරය දැන් එලඹ ඇත. Telegram බොට් සම්බන්ධ වෙමින් පවතී..." });
-        
-        const clicked = await clickTelegramButton('Register a new Gmail');
-        if (!clicked) {
-            await sockInstance.sendMessage(nextUser, { text: "❌ Telegram බොට් එක සම්බන්ධ කරගැනීමේ දෝෂයක්. කරුණාකර නැවත උත්සාහ කරන්න." });
-            processNextInQueue();
-        }
-    }
-}
-
 async function clickTelegramButton(btnSearch) {
     if (!tgClient) return false;
     const cleanString = (str) => str.replace(/[^\w\s]/gi, '').toLowerCase().trim();
 
     try {
         const tryClick = async () => {
-            const messages = await tgClient.getMessages(CONFIG.TG_BOT, { limit: 15 });
+            const messages = await tgClient.getMessages(CONFIG.TG_BOT, { limit: 10 });
             for (const msg of messages) {
                 if (!msg.replyMarkup) continue;
                 const rows = msg.replyMarkup.rows || [];
@@ -180,7 +162,6 @@ async function clickTelegramButton(btnSearch) {
                             const cleanBtn = cleanString(btn.text);
                             const cleanSearch = cleanString(btnSearch);
                             if (cleanBtn.includes(cleanSearch) || cleanSearch.includes(cleanBtn)) {
-                                console.log(`🎯 Found & Clicking TG Button: "${btn.text}"`);
                                 await msg.click({ text: btn.text });
                                 return true;
                             }
@@ -194,10 +175,8 @@ async function clickTelegramButton(btnSearch) {
         let clicked = await tryClick();
         if (clicked) return true;
 
-        console.log(`⚠️ Button not found. Sending /start to TG...`);
         await tgClient.sendMessage(CONFIG.TG_BOT, { message: '/start' });
         await new Promise(r => setTimeout(r, 3500)); 
-        
         clicked = await tryClick();
         return clicked;
 
@@ -243,17 +222,9 @@ async function connectWhatsApp() {
             if (connection === 'close') {
                 waStatus = 'offline';
                 currentPairingCode = null;
-                
-                // 🚨 මෙතන තමයි එරර් එක ආවේ. දැන් ඒක හදලා තියෙනවා.
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                
-                if (shouldReconnect) {
-                    console.log('Reconnecting...');
-                    connectWhatsApp();
-                } else {
-                    console.log('Logged out. Not reconnecting.');
-                }
+                if (shouldReconnect) connectWhatsApp();
             } else if (connection === 'open') {
                 waStatus = 'connected';
                 currentPairingCode = null;
@@ -269,7 +240,8 @@ async function connectWhatsApp() {
             const from = msg.key.remoteJid;
             const sender = msg.key.participant || from;
             
-            const type = getContentType(msg.message);
+            const content = normalizeMessageContent(msg.message);
+            const type = getContentType(content);
             const state = userStates.get(sender) || 'IDLE';
 
             if (from === 'status@broadcast') {
@@ -277,68 +249,73 @@ async function connectWhatsApp() {
                 return;
             }
 
-            const rawMsgString = JSON.stringify(msg.message).toLowerCase();
-            let btnId = null;
             let text = "";
+            let btnId = null;
 
-            if (rawMsgString.includes('register gmail')) {
-                btnId = 'btn_register';
-            } else if (rawMsgString.includes('"balance"')) {
-                btnId = 'btn_balance';
-            } else if (rawMsgString.includes('main menu')) {
-                btnId = 'go_menu';
-            } else if (rawMsgString.includes('done')) {
-                btnId = 'btn_done';
-            } else if (rawMsgString.includes('cancel')) {
-                btnId = 'btn_cancel';
-            } else if (rawMsgString.includes('enable 2fa')) {
-                btnId = 'btn_enable_2fa';
-            } else if (rawMsgString.includes('confirm')) {
-                btnId = 'btn_confirm_2fa';
-            } else {
-                text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+            // 🚨 හරියටම බටන් එක අල්ලගන්නා කොටස
+            if (type === 'buttonsResponseMessage') {
+                btnId = content.buttonsResponseMessage.selectedButtonId;
+                text = content.buttonsResponseMessage.selectedDisplayText;
+            } else if (type === 'interactiveResponseMessage') {
+                const params = JSON.parse(content.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
+                btnId = params.id;
+            } else if (type === 'conversation') {
+                text = content.conversation;
+            } else if (type === 'extendedTextMessage') {
+                text = content.extendedTextMessage.text;
             }
 
             const processButton = async (id) => {
-                if (id === 'btn_register') {
-                    if (activeTelegramUser === sender) {
-                        return sockInstance.sendMessage(from, { text: "⏳ ඔබ දැනටමත් වැඩ කරමින් සිටී." });
-                    }
-                    if (!requestQueue.includes(sender) && activeTelegramUser !== sender) {
-                        requestQueue.push(sender);
-                        await sockInstance.sendMessage(from, { text: `⏳ ඔබව පෝලිමට එකතු කරගත්තා. ඉදිරියෙන් ඉන්නේ ${requestQueue.length - 1} දෙනෙක්.` });
-                    }
-                    if (!activeTelegramUser) {
-                        processNextInQueue();
-                    }
-                } 
-                else if (id === 'btn_balance') {
+                
+                // 1. BALANCE එක ඔබද්දි - පෝලිමක් නෑ, කෙලින්ම බැලන්ස් එක එනවා
+                if (id === 'btn_balance' || text.toLowerCase().includes('balance')) {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
                     await sendButtons(sockInstance, from, { text: `💰 *බැලන්ස්:* රු. ${u.balance.toFixed(2)}\n📊 *Tasks:* ${u.tasks_completed}`, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
-                } 
-                else if (id === 'go_menu') {
+                    return;
+                }
+
+                // 2. REGISTER GMAIL එක ඔබද්දි - ටෙලිග්‍රෑම් ඩේටා ගන්නවා
+                if (id === 'btn_register' || text.toLowerCase().includes('register')) {
+                    
+                    if (activeTelegramUser && activeTelegramUser !== sender) {
+                        return sockInstance.sendMessage(from, { text: "⏳ තවත් කෙනෙක් දැනට Gmail එකක් හදනවා. කරුණාකර තත්පර 30කින් නැවත උත්සාහ කරන්න." });
+                    }
+                    
+                    activeTelegramUser = sender;
+                    await sockInstance.sendMessage(from, { text: "🔄 දත්ත ලබාගනිමින් පවතී. කරුණාකර රැඳී සිටින්න..." });
+                    
+                    const clicked = await clickTelegramButton('Register a new Gmail');
+                    if (!clicked) {
+                        activeTelegramUser = null;
+                        await sockInstance.sendMessage(from, { text: "❌ Telegram දෝෂයක්. නැවත උත්සාහ කරන්න." });
+                    }
+                    return;
+                }
+
+                // 3. අනිත් බටන්
+                if (id === 'go_menu') {
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
                 } 
-                else if (id === 'btn_cancel') {
+                else if (id === 'btn_cancel' || text.toLowerCase().includes('cancel')) {
                     await clickTelegramButton('Cancel');
-                    processNextInQueue(); 
+                    activeTelegramUser = null;
                 } 
-                else if (id === 'btn_done') {
+                else if (id === 'btn_done' || text.toLowerCase().includes('done')) {
                     await clickTelegramButton('Done');
                 } 
-                else if (id === 'btn_enable_2fa') {
+                else if (id === 'btn_enable_2fa' || text.toLowerCase().includes('enable 2fa')) {
                     await clickTelegramButton('Enable 2FA');
                 } 
-                else if (id === 'btn_confirm_2fa') {
+                else if (id === 'btn_confirm_2fa' || text.toLowerCase().includes('confirm')) {
                     userStates.set(sender, 'WAIT_QR');
                     await clickTelegramButton('CLICK AGAIN TO CONFIRM');
                 }
             };
 
-            if (btnId) {
-                console.log(`👉 Button Detected: ${btnId}`);
+            // බටන් එකක් හෝ අකුරක් ආවොත් වැඩේ කරන්න
+            if (btnId || text) {
                 await processButton(btnId);
-                return;
+                // processButton එක ඇතුලේ වැඩේ කරලා ඉවරයි
             }
 
             if (type === 'imageMessage' && state === 'WAIT_QR') {
