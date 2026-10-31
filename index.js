@@ -66,7 +66,10 @@ let waStatus = 'offline';
 let sockInstance = null;
 let tgClient = null;
 const userStates = new Map(); 
-let activeTelegramUser = null; 
+
+// 🚨 පෝලිම සහ මැපින්ග් සිස්ටම් එක
+let requestQueue = []; // වාරය එනකම් ඉන්න අය
+let activeTelegramUser = null; // දැනට ටෙලිග්‍රෑම් එකේ වැඩ කරන කෙනා
 
 const app = express();
 app.use(express.json());
@@ -93,17 +96,25 @@ async function initTelegram() {
         tgClient.addEventHandler(async (event) => {
             const message = event.message;
             if (!message) return;
-
+            
+            // අදාළ යූසර් කෙනෙක් නැත්නම් මැසේජ් එක අයින් කරනවා
             if (!activeTelegramUser) return;
 
             let text = message.message || message.text || '';
             if (!text && !message.media) return;
 
+            // 🚨 අනවශ්‍ය මැසේජ් (Broadcast/News) Filter කිරීම
             const isRelevant = /Register Gmail|Email|Password|Success|created|Enable 2FA|CLICK AGAIN|QR|Confirm|Done|Cancel/i.test(text) || message.media;
             if (!isRelevant) return; 
 
             text = text.replace(/from\s*[\d.]+\$\s*to\s*[\d.]+\$/gi, "LKR 30.00");
             text = text.replace(/[\d.]+(\$| USD)/gi, "LKR 30.00");
+
+            if (text.includes('too often')) {
+                await sockInstance.sendMessage(activeTelegramUser, { text: "⚠️ කරුණාකර තත්පර 30ක් රැඳී සිට නැවත උත්සාහ කරන්න. (Telegram Rate Limit)" });
+                processNextInQueue();
+                return;
+            }
 
             if (text.includes('Register Gmail accounts') || text.includes('Email:') || text.includes('Password:')) {
                 await sendButtons(sockInstance, activeTelegramUser, { 
@@ -123,7 +134,7 @@ async function initTelegram() {
                     await sendButtons(sockInstance, activeTelegramUser, { text: msg, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
                 }
                 userStates.delete(activeTelegramUser);
-                activeTelegramUser = null;
+                processNextInQueue(); // වැඩේ ඉවර නිසා ඊළඟ කෙනාට යවනවා
             } 
             else if (text.includes('Enable 2FA')) {
                 await sendButtons(sockInstance, activeTelegramUser, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA' }] });
@@ -141,38 +152,63 @@ async function initTelegram() {
     }
 }
 
-async function clickTelegramButton(btnText) {
-    if (!tgClient) return false;
-    try {
-        const messages = await tgClient.getMessages(CONFIG.TG_BOT, { limit: 5 });
-        for (const msg of messages) {
-            if (msg.replyMarkup && msg.replyMarkup.rows) {
-                const allButtons = msg.replyMarkup.rows.flatMap(row => row.buttons);
-                const targetBtn = allButtons.find(b => b.text.includes(btnText) || btnText.includes(b.text));
-                
-                if (targetBtn) {
-                    console.log(`👉 Clicking TG Button: ${targetBtn.text}`);
-                    await msg.click({ text: targetBtn.text });
-                    return true;
-                }
-            }
+// 🚨 පෝලිමේ ඉන්න ඊළඟ කෙනාව වැඩට ගන්නවා
+async function processNextInQueue() {
+    activeTelegramUser = null;
+    if (requestQueue.length > 0) {
+        const nextUser = requestQueue.shift(); // පෝලිමේ මුල ඉන්න කෙනාව ගන්නවා
+        activeTelegramUser = nextUser;
+        
+        await sockInstance.sendMessage(nextUser, { text: "🔄 ඔබගේ වාරය දැන් එලඹ ඇත. Telegram බොට් සම්බන්ධ වෙමින් පවතී..." });
+        
+        const clicked = await clickTelegramButton('Register a new Gmail');
+        if (!clicked) {
+            await sockInstance.sendMessage(nextUser, { text: "❌ Telegram බොට් එක සම්බන්ධ කරගැනීමේ දෝෂයක්. කරුණාකර නැවත උත්සාහ කරන්න." });
+            processNextInQueue(); // මේකෙන් ඊළඟ කෙනාට යවනවා
         }
-        return false;
-    } catch (e) {
-        return false;
     }
 }
 
-async function sendToTg(waUserId, text, mediaBuffer = null) {
-    if (!tgClient) return;
+async function clickTelegramButton(btnSearch) {
+    if (!tgClient) return false;
+    const cleanString = (str) => str.replace(/[^\w\s]/gi, '').toLowerCase().trim();
+
     try {
-        if (mediaBuffer) {
-            await tgClient.sendFile(CONFIG.TG_BOT, { file: mediaBuffer, caption: text });
-        } else {
-            await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
-        }
-    } catch (error) {
-        console.log("Error sending to TG:", error.message);
+        const tryClick = async () => {
+            const messages = await tgClient.getMessages(CONFIG.TG_BOT, { limit: 15 });
+            for (const msg of messages) {
+                if (!msg.replyMarkup) continue;
+                const rows = msg.replyMarkup.rows || [];
+                for (const row of rows) {
+                    for (const btn of row.buttons) {
+                        if (btn.text) {
+                            const cleanBtn = cleanString(btn.text);
+                            const cleanSearch = cleanString(btnSearch);
+                            if (cleanBtn.includes(cleanSearch) || cleanSearch.includes(cleanBtn)) {
+                                console.log(`🎯 Found & Clicking TG Button: "${btn.text}"`);
+                                await msg.click({ text: btn.text });
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            return false;
+        };
+
+        let clicked = await tryClick();
+        if (clicked) return true;
+
+        console.log(`⚠️ Button not found. Sending /start to TG...`);
+        await tgClient.sendMessage(CONFIG.TG_BOT, { message: '/start' });
+        await new Promise(r => setTimeout(r, 3500)); 
+        
+        clicked = await tryClick();
+        return clicked;
+
+    } catch (e) {
+        console.error("Click Button Error:", e);
+        return false;
     }
 }
 
@@ -237,47 +273,34 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // 🚨 DEBUG LOGS: බොට් එකට එන හැම මැසේජ් එකක්ම ලොග්ස් වල පෙන්නනවා
-            console.log("=========================================");
-            console.log(`📩 NEW MESSAGE RECEIVED FROM: ${sender}`);
-            console.log(`📦 MESSAGE TYPE: ${type}`);
-            console.log("=========================================");
-
             let text = "";
             let btnId = null;
 
-            try {
-                if (type === 'conversation') {
-                    text = msgContent.conversation;
-                } else if (type === 'extendedTextMessage') {
-                    text = msgContent.extendedTextMessage.text;
-                } else if (type === 'buttonsResponseMessage') {
-                    btnId = msgContent.buttonsResponseMessage.selectedButtonId;
-                    text = msgContent.buttonsResponseMessage.selectedDisplayText;
-                } else if (type === 'interactiveResponseMessage') {
-                    const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
-                    btnId = params.id;
-                    text = params.display_text || btnId;
-                } else if (type === 'templateButtonReplyMessage') {
-                    btnId = msgContent.templateButtonReplyMessage.selectedId;
-                    text = msgContent.templateButtonReplyMessage.selectedDisplayText;
-                }
-            } catch (err) {
-                console.log("Error parsing message:", err);
+            if (type === 'conversation') text = msgContent.conversation;
+            else if (type === 'extendedTextMessage') text = msgContent.extendedTextMessage.text;
+            else if (type === 'buttonsResponseMessage') {
+                btnId = msgContent.buttonsResponseMessage.selectedButtonId;
+                text = msgContent.buttonsResponseMessage.selectedDisplayText;
+            } else if (type === 'interactiveResponseMessage') {
+                const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
+                btnId = params.id;
+                text = params.display_text || btnId;
             }
 
-            console.log(`👉 PARSED DATA -> btnId: ${btnId} | text: ${text}`);
-
             const processButton = async (id) => {
-                console.log(`🎬 PROCESSING ACTION FOR: ${id}`);
-                
                 if (id === 'btn_register') {
-                    if (activeTelegramUser && activeTelegramUser !== sender) {
-                        return sockInstance.sendMessage(from, { text: "⏳ කරුණාකර රැඳී සිටින්න... තවත් කෙනෙක් දැනට වැඩ කරමින් සිටී." });
+                    if (activeTelegramUser === sender) {
+                        return sockInstance.sendMessage(from, { text: "⏳ ඔබ දැනටමත් වැඩ කරමින් සිටී." });
                     }
-                    activeTelegramUser = sender; 
-                    const clicked = await clickTelegramButton('Register a new Gmail');
-                    if (!clicked) await sendToTg(sender, '+ Register a new Gmail');
+                    if (!requestQueue.includes(sender) && activeTelegramUser !== sender) {
+                        requestQueue.push(sender);
+                        await sockInstance.sendMessage(from, { text: `⏳ ඔබව පෝලිමට එකතු කරගත්තා. ඉදිරියෙන් ඉන්නේ ${requestQueue.length - 1} දෙනෙක්.` });
+                    }
+                    
+                    // කවුරුවත් වැඩ කරන්නේ නැත්නම් කෙලින්ම පටන් ගන්නවා
+                    if (!activeTelegramUser) {
+                        processNextInQueue();
+                    }
                 } 
                 else if (id === 'btn_balance') {
                     let u = userService.find(sender) || { balance: 0, tasks_completed: 0 };
@@ -287,32 +310,26 @@ async function connectWhatsApp() {
                     await sendButtons(sockInstance, from, { image: { url: LOGO_URL }, title: 'Gmail Farmer', text: 'ආයුබෝවන්! ඔබට අවශ්‍ය සේවාව තෝරන්න:', buttons: [{ id: 'btn_register', text: '➕ Register Gmail' }, { id: 'btn_balance', text: '💰 Balance' }] });
                 } 
                 else if (id === 'btn_cancel') {
-                    const clicked = await clickTelegramButton('Cancel');
-                    if (!clicked) await sendToTg(sender, '/cancel');
-                    activeTelegramUser = null; 
+                    await clickTelegramButton('Cancel');
+                    processNextInQueue(); // Cancel කළාම ඊළඟ කෙනාට අවසර දෙනවා
                 } 
                 else if (id === 'btn_done') {
-                    const clicked = await clickTelegramButton('Done');
-                    if (!clicked) await sendToTg(sender, '/done');
+                    await clickTelegramButton('Done');
                 } 
                 else if (id === 'btn_enable_2fa') {
-                    const clicked = await clickTelegramButton('Enable 2FA');
-                    if (!clicked) await sendToTg(sender, 'Enable 2FA');
+                    await clickTelegramButton('Enable 2FA');
                 } 
                 else if (id === 'btn_confirm_2fa') {
                     userStates.set(sender, 'WAIT_QR');
-                    const clicked = await clickTelegramButton('CLICK AGAIN TO CONFIRM');
-                    if (!clicked) await sendToTg(sender, '/confirm');
+                    await clickTelegramButton('CLICK AGAIN TO CONFIRM');
                 }
             };
 
-            // 1. කෙලින්ම බටන් ID එකක් ආවොත්
             if (btnId) {
                 await processButton(btnId);
                 return;
             }
 
-            // 2. බටන් එක අකුරු විදියට ආවොත් (Fallback)
             if (text) {
                 const cleanText = text.trim().toLowerCase();
                 if (cleanText.includes('register gmail') || cleanText.includes('register a new gmail')) return await processButton('btn_register');
@@ -326,14 +343,18 @@ async function connectWhatsApp() {
 
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
-                await sendToTg(sender, 'QR Code එක ලැබුණා', buffer);
+                if(tgClient) {
+                    await tgClient.sendFile(CONFIG.TG_BOT, { file: buffer, caption: 'QR Code එක ලැබුණා' });
+                }
                 userStates.set(sender, 'WAIT_CODE');
                 await sockInstance.sendMessage(from, { text: '✅ QR Code එක ලැබුණා. දැන් ඔබට ලැබුණු අකුරු 16ේ කෝඩ් එක එවන්න.' });
                 return;
             }
 
             if (text && state === 'WAIT_CODE') {
-                await sendToTg(sender, text);
+                if(tgClient) {
+                    await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
+                }
                 return;
             }
 
