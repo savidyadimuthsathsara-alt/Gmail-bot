@@ -11,7 +11,7 @@ const { StringSession } = require("telegram/sessions");
 const {
     default: makeWASocket,
     useMultiFileAuthState,
-    DisconnectReason,
+    DisconnectReason, // මේක දැන් හරියට import වෙනවා
     Browsers,
     downloadMediaMessage,
     getContentType,
@@ -239,11 +239,21 @@ async function connectWhatsApp() {
 
         sockInstance.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect } = update;
+            
             if (connection === 'close') {
                 waStatus = 'offline';
                 currentPairingCode = null;
-                const shouldReconnect = (lastDisconnect?.error instanceof DisconnectReason || lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut);
-                if (shouldReconnect) connectWhatsApp();
+                
+                // 🚨 මෙතන තමයි එරර් එක ආවේ. දැන් ඒක හදලා තියෙනවා.
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                
+                if (shouldReconnect) {
+                    console.log('Reconnecting...');
+                    connectWhatsApp();
+                } else {
+                    console.log('Logged out. Not reconnecting.');
+                }
             } else if (connection === 'open') {
                 waStatus = 'connected';
                 currentPairingCode = null;
@@ -267,12 +277,10 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // 🚨 100% වැඩ කරන ඩීප් සර්ච් (Deep Search) ලොජික් එක
             const rawMsgString = JSON.stringify(msg.message).toLowerCase();
             let btnId = null;
             let text = "";
 
-            // බටන් එක ඔබද්දි මැසේජ් එක ඇතුලේ මොනව තිබුණත් මේකෙන් අල්ලගන්නවා
             if (rawMsgString.includes('register gmail')) {
                 btnId = 'btn_register';
             } else if (rawMsgString.includes('"balance"')) {
@@ -288,7 +296,6 @@ async function connectWhatsApp() {
             } else if (rawMsgString.includes('confirm')) {
                 btnId = 'btn_confirm_2fa';
             } else {
-                // සාමාන්‍ය අකුරු (Text commands) කියවන්න
                 text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
             }
 
@@ -328,14 +335,12 @@ async function connectWhatsApp() {
                 }
             };
 
-            // 1. බටන් එකක් හඳුනාගත්තොත් වැඩේ කරනවා
             if (btnId) {
                 console.log(`👉 Button Detected: ${btnId}`);
                 await processButton(btnId);
                 return;
             }
 
-            // 2. ෆොටෝ එකක් එව්වොත් (QR Code)
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 if(tgClient) {
@@ -346,7 +351,6 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // 3. අකුරු 16 කෝඩ් එක එව්වොත්
             if (text && state === 'WAIT_CODE') {
                 if(tgClient) {
                     await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
@@ -354,7 +358,6 @@ async function connectWhatsApp() {
                 return;
             }
 
-            // 4. සාමාන්‍ය කමාන්ඩ්ස්
             if (text) {
                 const cmd = text.trim().toLowerCase();
                 if (cmd === '/start' || cmd === '.menu') {
