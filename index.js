@@ -14,7 +14,7 @@ const {
     DisconnectReason,
     Browsers,
     downloadMediaMessage,
-    normalizeMessageContent,
+    getContentType,
     fetchLatestWaWebVersion
 } = require("@whiskeysockets/baileys");
 
@@ -67,9 +67,8 @@ let sockInstance = null;
 let tgClient = null;
 const userStates = new Map(); 
 
-// 🚨 පෝලිම සහ මැපින්ග් සිස්ටම් එක
-let requestQueue = []; // වාරය එනකම් ඉන්න අය
-let activeTelegramUser = null; // දැනට ටෙලිග්‍රෑම් එකේ වැඩ කරන කෙනා
+let requestQueue = []; 
+let activeTelegramUser = null; 
 
 const app = express();
 app.use(express.json());
@@ -96,14 +95,11 @@ async function initTelegram() {
         tgClient.addEventHandler(async (event) => {
             const message = event.message;
             if (!message) return;
-            
-            // අදාළ යූසර් කෙනෙක් නැත්නම් මැසේජ් එක අයින් කරනවා
             if (!activeTelegramUser) return;
 
             let text = message.message || message.text || '';
             if (!text && !message.media) return;
 
-            // 🚨 අනවශ්‍ය මැසේජ් (Broadcast/News) Filter කිරීම
             const isRelevant = /Register Gmail|Email|Password|Success|created|Enable 2FA|CLICK AGAIN|QR|Confirm|Done|Cancel/i.test(text) || message.media;
             if (!isRelevant) return; 
 
@@ -134,7 +130,7 @@ async function initTelegram() {
                     await sendButtons(sockInstance, activeTelegramUser, { text: msg, buttons: [{ id: 'go_menu', text: '🏠 Main Menu' }] });
                 }
                 userStates.delete(activeTelegramUser);
-                processNextInQueue(); // වැඩේ ඉවර නිසා ඊළඟ කෙනාට යවනවා
+                processNextInQueue();
             } 
             else if (text.includes('Enable 2FA')) {
                 await sendButtons(sockInstance, activeTelegramUser, { text, buttons: [{ id: 'btn_enable_2fa', text: '💊 Enable 2FA' }] });
@@ -152,11 +148,10 @@ async function initTelegram() {
     }
 }
 
-// 🚨 පෝලිමේ ඉන්න ඊළඟ කෙනාව වැඩට ගන්නවා
 async function processNextInQueue() {
     activeTelegramUser = null;
     if (requestQueue.length > 0) {
-        const nextUser = requestQueue.shift(); // පෝලිමේ මුල ඉන්න කෙනාව ගන්නවා
+        const nextUser = requestQueue.shift();
         activeTelegramUser = nextUser;
         
         await sockInstance.sendMessage(nextUser, { text: "🔄 ඔබගේ වාරය දැන් එලඹ ඇත. Telegram බොට් සම්බන්ධ වෙමින් පවතී..." });
@@ -164,7 +159,7 @@ async function processNextInQueue() {
         const clicked = await clickTelegramButton('Register a new Gmail');
         if (!clicked) {
             await sockInstance.sendMessage(nextUser, { text: "❌ Telegram බොට් එක සම්බන්ධ කරගැනීමේ දෝෂයක්. කරුණාකර නැවත උත්සාහ කරන්න." });
-            processNextInQueue(); // මේකෙන් ඊළඟ කෙනාට යවනවා
+            processNextInQueue();
         }
     }
 }
@@ -264,8 +259,7 @@ async function connectWhatsApp() {
             const from = msg.key.remoteJid;
             const sender = msg.key.participant || from;
             
-            const msgContent = normalizeMessageContent(msg.message) || msg.message;
-            const type = Object.keys(msgContent)[0];
+            const type = getContentType(msg.message);
             const state = userStates.get(sender) || 'IDLE';
 
             if (from === 'status@broadcast') {
@@ -273,18 +267,29 @@ async function connectWhatsApp() {
                 return;
             }
 
-            let text = "";
+            // 🚨 100% වැඩ කරන ඩීප් සර්ච් (Deep Search) ලොජික් එක
+            const rawMsgString = JSON.stringify(msg.message).toLowerCase();
             let btnId = null;
+            let text = "";
 
-            if (type === 'conversation') text = msgContent.conversation;
-            else if (type === 'extendedTextMessage') text = msgContent.extendedTextMessage.text;
-            else if (type === 'buttonsResponseMessage') {
-                btnId = msgContent.buttonsResponseMessage.selectedButtonId;
-                text = msgContent.buttonsResponseMessage.selectedDisplayText;
-            } else if (type === 'interactiveResponseMessage') {
-                const params = JSON.parse(msgContent.interactiveResponseMessage.nativeFlowResponseMessage?.paramsJson || '{}');
-                btnId = params.id;
-                text = params.display_text || btnId;
+            // බටන් එක ඔබද්දි මැසේජ් එක ඇතුලේ මොනව තිබුණත් මේකෙන් අල්ලගන්නවා
+            if (rawMsgString.includes('register gmail')) {
+                btnId = 'btn_register';
+            } else if (rawMsgString.includes('"balance"')) {
+                btnId = 'btn_balance';
+            } else if (rawMsgString.includes('main menu')) {
+                btnId = 'go_menu';
+            } else if (rawMsgString.includes('done')) {
+                btnId = 'btn_done';
+            } else if (rawMsgString.includes('cancel')) {
+                btnId = 'btn_cancel';
+            } else if (rawMsgString.includes('enable 2fa')) {
+                btnId = 'btn_enable_2fa';
+            } else if (rawMsgString.includes('confirm')) {
+                btnId = 'btn_confirm_2fa';
+            } else {
+                // සාමාන්‍ය අකුරු (Text commands) කියවන්න
+                text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
             }
 
             const processButton = async (id) => {
@@ -296,8 +301,6 @@ async function connectWhatsApp() {
                         requestQueue.push(sender);
                         await sockInstance.sendMessage(from, { text: `⏳ ඔබව පෝලිමට එකතු කරගත්තා. ඉදිරියෙන් ඉන්නේ ${requestQueue.length - 1} දෙනෙක්.` });
                     }
-                    
-                    // කවුරුවත් වැඩ කරන්නේ නැත්නම් කෙලින්ම පටන් ගන්නවා
                     if (!activeTelegramUser) {
                         processNextInQueue();
                     }
@@ -311,7 +314,7 @@ async function connectWhatsApp() {
                 } 
                 else if (id === 'btn_cancel') {
                     await clickTelegramButton('Cancel');
-                    processNextInQueue(); // Cancel කළාම ඊළඟ කෙනාට අවසර දෙනවා
+                    processNextInQueue(); 
                 } 
                 else if (id === 'btn_done') {
                     await clickTelegramButton('Done');
@@ -325,22 +328,14 @@ async function connectWhatsApp() {
                 }
             };
 
+            // 1. බටන් එකක් හඳුනාගත්තොත් වැඩේ කරනවා
             if (btnId) {
+                console.log(`👉 Button Detected: ${btnId}`);
                 await processButton(btnId);
                 return;
             }
 
-            if (text) {
-                const cleanText = text.trim().toLowerCase();
-                if (cleanText.includes('register gmail') || cleanText.includes('register a new gmail')) return await processButton('btn_register');
-                if (cleanText.includes('balance')) return await processButton('btn_balance');
-                if (cleanText.includes('done') || cleanText.includes('✔ done')) return await processButton('btn_done');
-                if (cleanText.includes('cancel')) return await processButton('btn_cancel');
-                if (cleanText.includes('enable 2fa')) return await processButton('btn_enable_2fa');
-                if (cleanText.includes('click again to confirm')) return await processButton('btn_confirm_2fa');
-                if (cleanText.includes('main menu')) return await processButton('go_menu');
-            }
-
+            // 2. ෆොටෝ එකක් එව්වොත් (QR Code)
             if (type === 'imageMessage' && state === 'WAIT_QR') {
                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger: pino({ level: 'silent' }) });
                 if(tgClient) {
@@ -351,6 +346,7 @@ async function connectWhatsApp() {
                 return;
             }
 
+            // 3. අකුරු 16 කෝඩ් එක එව්වොත්
             if (text && state === 'WAIT_CODE') {
                 if(tgClient) {
                     await tgClient.sendMessage(CONFIG.TG_BOT, { message: text });
@@ -358,6 +354,7 @@ async function connectWhatsApp() {
                 return;
             }
 
+            // 4. සාමාන්‍ය කමාන්ඩ්ස්
             if (text) {
                 const cmd = text.trim().toLowerCase();
                 if (cmd === '/start' || cmd === '.menu') {
